@@ -33,11 +33,9 @@ Phase 1:
 - **Gate size thresholds raised** (MAX_FILES 15 -> 40, MAX_LINES 600 -> 4000) so the multi-week
   Phase 1 spike isn't auto-escalated on diff size alone (per your choice to keep Phase 1 whole).
 - **Plan split** into `plan_docs/phase_01..04_*.md` with parseable Scope sections.
-- **OPEN ITEM — hook interpreter fix needs your authorization.** `.claude/settings.json` calls the
-  hooks with `python3`, which does not exist on this machine (both `python3`/`python` are the Windows
-  Store stub; only `.pixi/envs/default/python.exe` works, via `pixi run python`). Editing
-  `settings.json` was blocked by the permission classifier as self-modification of startup config.
-  Until fixed, the SubagentStop gate and the no-headless guard do not auto-fire; the orchestrator
-  runs `gate.py` manually after each phase instead (same deterministic script, just hand-invoked).
+- **Hook interpreter fixed (you authorized, 2026-06-20).** `.claude/settings.json` now calls the
+  hooks via `pixi run python` (was `python3`, which is absent here — both `python3`/`python` are the
+  Windows Store stub; only `.pixi/envs/default/python.exe` works). The SubagentStop gate and the
+  no-headless billing guard now auto-fire. Gate logic was validated by a manual dry-run first.
 
 ## Next: Phase 1 — GPU-FPP feasibility spike + toolchain validation

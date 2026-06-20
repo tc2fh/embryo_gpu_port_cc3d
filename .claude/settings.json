@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/gate.py"
+            "command": "pixi run python .claude/hooks/gate.py"
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/no_headless.py"
+            "command": "pixi run python .claude/hooks/no_headless.py"
           }
         ]
       }
