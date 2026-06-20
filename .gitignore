@@ -1,0 +1,21 @@
+# phase-workflow runtime state (regenerated each run)
+.phaserun/
+**/__pycache__/
+
+# conda/pixi environment (huge, regenerable from pixi.lock)
+.pixi/
+
+# vendored CC3D source trees — read-only porting reference only, large (per plan)
+CompuCell3D/
+cc3d-player5/
+
+# Embryo_Model_dev is its own git repo with a remote — versioned independently,
+# NOT nested in this workflow repo (see PROGRESS.md "Harness wiring"). Keeps the
+# phase gate's git diff clean (its _settings*.sqlite churn would else false-flag it).
+Embryo_Model_dev/
+
+# regenerable run / profiling outputs
+**/_runs/
+
+# CC3D player per-user settings (regenerable, user-specific)
+**/_settings*.sqlite

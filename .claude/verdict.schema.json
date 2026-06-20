@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["phase_status", "plan_deviation", "escalate", "escalation_reasons", "handoff_delta"],
+  "properties": {
+    "phase_status": { "type": "string", "enum": ["complete", "complete_with_issues", "blocked"] },
+    "plan_deviation": { "type": "string", "enum": ["none", "minor", "major"] },
+    "escalate": { "type": "boolean" },
+    "escalation_reasons": { "type": "array", "items": { "type": "string" } },
+    "handoff_delta": {
+      "type": "string",
+      "description": "What ACTUALLY happened this phase: decisions, surprises, deviations, plus a pointer to the next phase's plan_docs section. NOT a restatement of the plan."
+    }
+  }
+}

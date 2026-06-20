@@ -1,0 +1,27 @@
+[workspace]
+authors = ["tc2fh <tc2fh@virginia.edu>"]
+channels = ["compucell3d", "https://repo.anaconda.com/pkgs/main", "conda-forge"]
+channel-priority = "disabled"
+name = "CNN_unfolding"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[pypi-options]
+extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
+
+[tasks]
+
+[dependencies]
+python = "3.12.*"
+tensorboard = ">=2.20.0,<3"
+compucell3d = ">=4.7.0,<4.8"
+
+[pypi-dependencies]
+torch = "*"
+torchvision = "*"
+lightning = ">=2.6.1, <3"
+pandas = ">=3.0.0, <4"
+matplotlib = ">=3.10.8, <4"
+zarr = ">=3.1.5, <4"
+scikit-learn = ">=1.8.0, <2"
+scikit-image = ">=0.26.0, <0.27"
