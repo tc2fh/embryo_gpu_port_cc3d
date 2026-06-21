@@ -257,4 +257,43 @@ Outstanding carry-forwards: (i) the long-horizon offline CC3D closure/intercalat
 NOT been run; (ii) the 27-color race-safe order-4 GPU SWEEP is future work (order-4 contact ENERGY is already shown
 GPU-reproducible, rel 0.029); production `EmbryoModel` stays at `contact_neighbor_order=3` (race-safe).
 
-## Next: Phase 4 — batching / scaling / bridge (plan_docs/phase_04_batching_scaling_bridge.md)
+## Phase 4 — batching / scaling / bridge — IN PROGRESS (plan_docs/phase_04_batching_scaling_bridge.md)
+
+Driven as tested passes (batch dimension / CUDA-graph + throughput / larger-lattice + bridge), each left
+`pytest -q gpu_port` green. Scope: `gpu_port/{engine,bridge,phase4}` — `embryo/` is OUT of scope this phase.
+
+### Pass A — batch / replica dimension for sweeps — DONE (2026-06-20)
+
+Deterministic gate: CLEAN (gate fresh: tests_passed=true, **56 passed / 1 sanctioned skip** [49 prior + 7 new],
+reported 4 files / 594 lines; real size ~950 lines / 5 files, in scope, no destructive ops, `embryo/` untouched).
+Implemented:
+- **New `gpu_port/engine/batched.py`** — `BatchedGPUEngine` / `BatchedState` / `run_batched`, a SEPARATE class
+  (single-engine `engine.py` untouched → all 49 prior tests structurally unaffected). Replica `R` is the leading
+  (slowest) dim: id-lattice `ids[r*nvox + lin]`, per-cell SoA `arr[r*n1 + cid]`; one thread = (replica, color-voxel),
+  launch `R*color_threads`. Within a replica the voxel stride matches the single engine (coalesced); each replica's
+  int64-COM / f32-volume atomics target a disjoint `[r*n1,(r+1)*n1)` range -> no cross-replica collisions, no float
+  atomics across the batch axis.
+- **Additive kernels in `kernels.py`** (+285, 0 deletions; existing kernels byte-unchanged):
+  `metropolis_color_batched_kernel` + batched volume/COM, contact-energy, surface kernels + `contact_rt`/`get_id_b`.
+- **Philox replica key:** `seed = base_seed_r[r] + mcs*131072 + color*16384`, `rand_init` 2nd arg = local voxel idx;
+  `base_seed_r[r] = base_seed + r*2000003`. So batched replica r == a single `GPUEngine` seeded `base_seed+r*stride`,
+  BIT-EXACT.
+- **Per-replica params:** `per_replica_config` = length-R list of `EngineConfig`; swept fields (contact matrix,
+  lambda/target volume, temperature, seed) uploaded as flat per-replica arrays; structural fields asserted identical
+  across replicas. Mirrors the `ifPythonCall`/`RunNumber` injection seam.
+- **Tests** (phase4/tests/test_batched_engine.py, 7 new): per-replica == independent single runs BIT-EXACT over R=6
+  (id-lattice / int64 COM / volumes array_equal; pooled volume mean-rel 0.0, KS D=0 p=1 — stronger than the KS gate);
+  sweep varies (lambda_volume [1,2,4,8] -> MSD-from-target [566,141,31,11] monotone; contact sweep distinct energies);
+  reproducibility bit-identical; R=1 == single GPUEngine; per-replica partition invariant exact.
+
+Decisions / notes (neither escalates):
+- One test-design fix (engine was correct throughout): `test_sweep_varies` first asserted monotone raw mean-volume vs
+  lambda — false in strong-adhesion CPM (weak lambda dissolves cells to V=0; strong lambda adds discreteness noise).
+  Switched to mean-squared-deviation-from-target over a middle lambda range — the regime-robust volume-constraint signal.
+- **Carry-forwards:** (i) the batched path runs Volume+Contact only (`fpp_enabled=0`); **batched FPP** needs a
+  per-replica link CSR — deferred (FPP params aren't in this pass's sweep set). (ii) **End-to-end batched `EmbryoModel`**
+  needs edits under `embryo/` (out of Phase 4 scope) — deferred; the batch axis is validated at the engine level
+  (Phase-2 style), the in-scope deliverable.
+
+Next: Pass B — wrap the per-MCS loop in a CUDA Graph (dynamic link create/delete behind `wp.capture_if`) to cut
+launch/Python overhead; benchmark MCS/s + sims/hour vs the Phase-0 tuned multicore CPU baseline (~10.5 MCS/s).

@@ -277,6 +277,291 @@ def metropolis_color_kernel(
 
 
 # ---------------------------------------------------------------------------
+# BATCHED Metropolis (Phase 4 Pass A) -- R independent replicas, one launch.
+#
+# Layout (documented, coalescing-preserving): the replica axis is the SLOWEST
+# (leading) dimension. The id-lattice is flat ``ids[r*nvox + lin_idx(x,y,z)]`` and
+# every per-cell SoA array is ``arr[r*n1 + cid]``; within a fixed replica the voxel
+# stride is exactly the single-engine stride, so per-color voxel reads/writes stay
+# coalesced. One thread = (replica, color-voxel) pair: ``dim = R*color_threads``,
+# ``r = tid/color_threads``, ``local = tid%color_threads``. Replicas never read or
+# write outside their own [r*nvox, (r+1)*nvox) / [r*n1, (r+1)*n1) slices, so they
+# are independent (no cross-replica interaction).
+#
+# Reproducibility: the Philox key folds the replica in via a PER-REPLICA base seed
+# (``base_seed_r[r]``, host sets it to base_seed + r*stride) and is otherwise the
+# single-engine key ``+ mcs*131072 + color*16384``; ``rand_init``'s second arg is
+# the LOCAL voxel index (0..nvox-1), identical to the single engine. Hence batched
+# replica r == a single GPUEngine run seeded base_seed + r*stride, BIT-EXACT. COM /
+# volume use int64 / float atomics into the replica's own slice -- the int64 COM is
+# bit-reproducible; volume is an exact voxel count (NO float atomics across the
+# batch axis: each replica's atomics target a disjoint address range).
+#
+# Per-replica swept params: ``contact`` is flat ``[r*nt*nt + t1*nt + t2]``,
+# ``target_volume``/``lambda_volume`` are per-replica-per-cell ``[r*n1 + cid]``,
+# ``temperature`` is per-replica ``[r]``. FPP is single-replica only (Phase 4 Pass
+# A defers batched FPP); ``fpp_enabled`` is 0 in the batched path.
+# ---------------------------------------------------------------------------
+@wp.func
+def contact_rt(contact: wp.array(dtype=wp.float32),
+               r: wp.int32, n_types: wp.int32,
+               t1: wp.int32, t2: wp.int32) -> wp.float32:
+    return contact[r * n_types * n_types + t1 * n_types + t2]
+
+
+@wp.func
+def get_id_b(ids: wp.array(dtype=wp.int32),
+             vox_base: wp.int32,
+             x: wp.int32, y: wp.int32, z: wp.int32,
+             Lx: wp.int32, Ly: wp.int32, Lz: wp.int32) -> wp.int32:
+    # out-of-bounds is Medium (id 0); in-bounds reads the replica's own slice
+    if not in_bounds(x, y, z, Lx, Ly, Lz):
+        return wp.int32(0)
+    return ids[vox_base + lin_idx(x, y, z, Lx, Ly)]
+
+
+@wp.kernel
+def metropolis_color_batched_kernel(
+    ids: wp.array(dtype=wp.int32),                 # (R*nvox,) flat, replica-major
+    cell_type: wp.array(dtype=wp.int32),           # (n_types-indexed) per-cell type, shared
+    cell_type_r: wp.int32,                         # 0 -> cell_type shared; 1 -> per-replica (R*n1)
+    volume: wp.array(dtype=wp.float32),            # (R*n1,)
+    xsum: wp.array(dtype=wp.int64),                # (R*n1,)
+    ysum: wp.array(dtype=wp.int64),
+    zsum: wp.array(dtype=wp.int64),
+    target_volume: wp.array(dtype=wp.float32),     # (R*n1,) per-replica-per-cell
+    lambda_volume: wp.array(dtype=wp.float32),     # (R*n1,)
+    contact: wp.array(dtype=wp.float32),           # (R*n_types*n_types,) flat per replica
+    n_types: wp.int32,
+    type_frozen: wp.array(dtype=wp.int32),         # (n_types,) shared across replicas
+    contact_off: wp.array(dtype=wp.int32),
+    n_contact: wp.int32,
+    flip_off: wp.array(dtype=wp.int32),
+    n_flip: wp.int32,
+    Lx: wp.int32, Ly: wp.int32, Lz: wp.int32,
+    nvox: wp.int32,
+    n1: wp.int32,
+    R: wp.int32,
+    color_threads: wp.int32,
+    color: wp.int32,
+    mcs: wp.int32,
+    base_seed_r: wp.array(dtype=wp.int32),         # (R,) per-replica base seed
+    temperature: wp.array(dtype=wp.float32),       # (R,) per-replica temperature
+):
+    gid = wp.tid()
+    r = gid / color_threads
+    tid = gid % color_threads
+    if r >= R:
+        return
+
+    # ---- decode this color's sublattice and map tid -> lattice coords ----
+    cx = color & 1
+    cy = (color >> 1) & 1
+    cz = (color >> 2) & 1
+    nx = (Lx - cx + 1) / 2
+    ny = (Ly - cy + 1) / 2
+    nz = (Lz - cz + 1) / 2
+    total = nx * ny * nz
+    if tid >= total:
+        return
+    ix = tid % nx
+    rem = tid / nx
+    iy = rem % ny
+    iz = rem / ny
+    x = cx + 2 * ix
+    y = cy + 2 * iy
+    z = cz + 2 * iz
+
+    # per-replica base offsets into the flat lattice / SoA
+    vox_base = r * nvox
+    cell_base = r * n1
+    ct_base = cell_type_r * cell_base       # 0 if shared, r*n1 if per-replica
+
+    local_idx = lin_idx(x, y, z, Lx, Ly)
+    target_idx = vox_base + local_idx
+    old_id = ids[target_idx]
+    old_t = cell_type[ct_base + old_id]
+
+    if old_id != 0 and type_frozen[old_t] == 1:
+        return
+
+    # ---- RNG: stateless Philox keyed by (mcs, color, per-replica base seed) ----
+    # rand_init's 2nd arg is the LOCAL voxel index -> identical stream to a single
+    # GPUEngine run seeded base_seed_r[r] (bit-exact batched==single).
+    seed = base_seed_r[r] + mcs * 131072 + color * 16384
+    state = wp.rand_init(seed, local_idx)
+
+    # ---- pick a source neighbor; its cell id is the candidate new_id ----
+    k = wp.randi(state, 0, n_flip)
+    sx = x + flip_off[3 * k + 0]
+    sy = y + flip_off[3 * k + 1]
+    sz = z + flip_off[3 * k + 2]
+    if not in_bounds(sx, sy, sz, Lx, Ly, Lz):
+        return
+    new_id = ids[vox_base + lin_idx(sx, sy, sz, Lx, Ly)]
+    if new_id == old_id:
+        return
+    new_t = cell_type[ct_base + new_id]
+    if new_id != 0 and type_frozen[new_t] == 1:
+        return
+
+    # ---- Volume delta (incremental, VolumePlugin::changeEnergyByCellType) ----
+    de = float(0.0)
+    if new_id != 0:
+        de += lambda_volume[cell_base + new_id] * (
+            1.0 + 2.0 * (volume[cell_base + new_id] - target_volume[cell_base + new_id])
+        )
+    if old_id != 0:
+        de += lambda_volume[cell_base + old_id] * (
+            1.0 - 2.0 * (volume[cell_base + old_id] - target_volume[cell_base + old_id])
+        )
+
+    # ---- Contact delta over the contact shell (ContactPlugin::changeEnergy) ----
+    for n in range(n_contact):
+        nnx = x + contact_off[3 * n + 0]
+        nny = y + contact_off[3 * n + 1]
+        nnz = z + contact_off[3 * n + 2]
+        ncell = get_id_b(ids, vox_base, nnx, nny, nnz, Lx, Ly, Lz)
+        nt = cell_type[ct_base + ncell]
+        if ncell != old_id:
+            de -= contact_rt(contact, r, n_types, old_t, nt)
+        if ncell != new_id:
+            de += contact_rt(contact, r, n_types, new_t, nt)
+
+    # ---- Metropolis acceptance (DefaultAcceptanceFunction) ----
+    accept = False
+    if de <= 0.0:
+        accept = True
+    else:
+        if wp.randf(state) < wp.exp(-de / temperature[r]):
+            accept = True
+    if not accept:
+        return
+
+    # ---- apply: lattice write + atomic SoA updates (replica-local slice) ----
+    ids[target_idx] = new_id
+    fx = wp.int64(x)
+    fy = wp.int64(y)
+    fz = wp.int64(z)
+    if old_id != 0:
+        wp.atomic_add(volume, cell_base + old_id, -1.0)
+        wp.atomic_add(xsum, cell_base + old_id, -fx)
+        wp.atomic_add(ysum, cell_base + old_id, -fy)
+        wp.atomic_add(zsum, cell_base + old_id, -fz)
+    if new_id != 0:
+        wp.atomic_add(volume, cell_base + new_id, 1.0)
+        wp.atomic_add(xsum, cell_base + new_id, fx)
+        wp.atomic_add(ysum, cell_base + new_id, fy)
+        wp.atomic_add(zsum, cell_base + new_id, fz)
+
+
+@wp.kernel
+def recompute_volume_com_batched_kernel(
+    ids: wp.array(dtype=wp.int32),                 # (R*nvox,)
+    Lx: wp.int32, Ly: wp.int32, Lz: wp.int32,
+    nvox: wp.int32,
+    n1: wp.int32,
+    volume: wp.array(dtype=wp.float32),            # (R*n1,)
+    xsum: wp.array(dtype=wp.int64),
+    ysum: wp.array(dtype=wp.int64),
+    zsum: wp.array(dtype=wp.int64),
+):
+    """Batched recompute of per-cell volume + int64 COM sums from the id-lattice
+    (one thread per (replica,voxel)). Arrays must be zeroed first. Used to init and
+    to assert the incremental atomics never drift, per replica."""
+    g = wp.tid()
+    r = g / nvox
+    i = g % nvox
+    cid = ids[g]
+    if cid == 0:
+        return
+    x = i % Lx
+    rem = i / Lx
+    y = rem % Ly
+    z = rem / Ly
+    cell_base = r * n1
+    wp.atomic_add(volume, cell_base + cid, 1.0)
+    wp.atomic_add(xsum, cell_base + cid, wp.int64(x))
+    wp.atomic_add(ysum, cell_base + cid, wp.int64(y))
+    wp.atomic_add(zsum, cell_base + cid, wp.int64(z))
+
+
+@wp.kernel
+def total_contact_energy_batched_kernel(
+    ids: wp.array(dtype=wp.int32),                 # (R*nvox,)
+    cell_type: wp.array(dtype=wp.int32),
+    cell_type_r: wp.int32,
+    contact: wp.array(dtype=wp.float32),           # (R*n_types*n_types,)
+    n_types: wp.int32,
+    contact_off: wp.array(dtype=wp.int32),
+    n_contact: wp.int32,
+    Lx: wp.int32, Ly: wp.int32, Lz: wp.int32,
+    nvox: wp.int32,
+    n1: wp.int32,
+    contact_accum: wp.array(dtype=wp.float32),     # (R,) atomically summed per replica
+):
+    """Per-replica contact energy = 0.5 * sum over voxels of sum over shell
+    J(t_self,t_nbr) for differing-cell neighbors. One thread per (replica,voxel)."""
+    g = wp.tid()
+    r = g / nvox
+    i = g % nvox
+    vox_base = r * nvox
+    cell_base = r * n1
+    ct_base = cell_type_r * cell_base
+    self_id = ids[g]
+    x = i % Lx
+    rem = i / Lx
+    y = rem % Ly
+    z = rem / Ly
+    self_t = cell_type[ct_base + self_id]
+    e = float(0.0)
+    for n in range(n_contact):
+        nnx = x + contact_off[3 * n + 0]
+        nny = y + contact_off[3 * n + 1]
+        nnz = z + contact_off[3 * n + 2]
+        ncell = get_id_b(ids, vox_base, nnx, nny, nnz, Lx, Ly, Lz)
+        if ncell != self_id:
+            nt = cell_type[ct_base + ncell]
+            e += contact_rt(contact, r, n_types, self_t, nt)
+    wp.atomic_add(contact_accum, r, 0.5 * e)
+
+
+@wp.kernel
+def surface_batched_kernel(
+    ids: wp.array(dtype=wp.int32),                 # (R*nvox,)
+    Lx: wp.int32, Ly: wp.int32, Lz: wp.int32,
+    nvox: wp.int32,
+    n1: wp.int32,
+    surf_off: wp.array(dtype=wp.int32),
+    n_surf: wp.int32,
+    surface: wp.array(dtype=wp.int32),             # (R*n1,) per-cell surface area
+):
+    """Per-replica per-cell surface area = count of (voxel, shell-neighbor) pairs
+    where the neighbor belongs to a different cell. One thread per (replica,voxel)."""
+    g = wp.tid()
+    r = g / nvox
+    i = g % nvox
+    vox_base = r * nvox
+    cell_base = r * n1
+    self_id = ids[g]
+    if self_id == 0:
+        return
+    x = i % Lx
+    rem = i / Lx
+    y = rem % Ly
+    z = rem / Ly
+    s = wp.int32(0)
+    for n in range(n_surf):
+        nnx = x + surf_off[3 * n + 0]
+        nny = y + surf_off[3 * n + 1]
+        nnz = z + surf_off[3 * n + 2]
+        ncell = get_id_b(ids, vox_base, nnx, nny, nnz, Lx, Ly, Lz)
+        if ncell != self_id:
+            s += 1
+    wp.atomic_add(surface, cell_base + self_id, s)
+
+
+# ---------------------------------------------------------------------------
 # Tracker / observable kernels
 # ---------------------------------------------------------------------------
 @wp.kernel

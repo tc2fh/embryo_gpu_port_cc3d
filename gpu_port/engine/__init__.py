@@ -23,6 +23,13 @@ from .state import (
     com_accumulators,
 )
 from .engine import GPUEngine, run_gpu
+from .batched import (
+    BatchedGPUEngine,
+    BatchedState,
+    build_batched_grid_state,
+    batched_state_from_lattices,
+    run_batched,
+)
 from .cpu_reference import CPUReference
 from .fpp import FPPLinks, grid_graph_links
 from . import geometry
@@ -42,6 +49,11 @@ __all__ = [
     "com_accumulators",
     "GPUEngine",
     "run_gpu",
+    "BatchedGPUEngine",
+    "BatchedState",
+    "build_batched_grid_state",
+    "batched_state_from_lattices",
+    "run_batched",
     "CPUReference",
     "FPPLinks",
     "grid_graph_links",
