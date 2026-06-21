@@ -185,17 +185,21 @@ class TissueLinkSteppable(GPUSteppable):
                                  csr=self.shared_csr, cells=self.managed,
                                  cell_type=self._cell_type)
         link_map = self._current_link_map()
+        new_a, new_b = [], []
         for c in self.managed:
             c = int(c)
             for nb in adj[c]:
                 nb = int(nb)
                 if nb in link_map.get(c, ()):  # get_fpp_link_by_cells(...) is None guard
                     continue
-                self.links.create_link(c, nb, lam=self.p.tissue_lambda,
-                                       target=self.p.tissue_target, maxlen=self.p.tissue_max)
+                new_a.append(c)
+                new_b.append(nb)
                 self._tissue.add(self._key(c, nb))
                 link_map.setdefault(c, set()).add(nb)
                 link_map.setdefault(nb, set()).add(c)
+        if new_a:  # one allocation for the whole batch (vs O(M) per link)
+            self.links.create_links_bulk(new_a, new_b, lam=self.p.tissue_lambda,
+                                         target=self.p.tissue_target, maxlen=self.p.tissue_max)
         return len(self._tissue)
 
     def step(self, mcs: int):
@@ -205,16 +209,20 @@ class TissueLinkSteppable(GPUSteppable):
         if tissue_list:
             dec = _bernoulli(len(tissue_list), p.tissue_delete_prob, mcs,
                              self.engine.base_seed, _STREAM_TISSUE, self.engine.device)
+            to_delete = []
             for i, (a, b) in enumerate(tissue_list):
                 if dec[i] == 1:
-                    self.links.delete_link(a, b)
+                    to_delete.append((a, b))
                     self._tissue.discard((a, b))
+            if to_delete:  # one vectorized compaction for the whole batch
+                self.links.delete_links_bulk(to_delete)
 
         # --- (2) recreate tissue links to neighbors under the per-cell cap ---
         adj = neighbor_adjacency(self.engine, exclude_types=(self.substrate_type,),
                                  csr=self.shared_csr, cells=self.managed,
                                  cell_type=self._cell_type)
         link_map = self._current_link_map()
+        new_a, new_b = [], []
         for c in self.managed:
             c = int(c)
             partners = link_map.get(c, set())
@@ -226,11 +234,14 @@ class TissueLinkSteppable(GPUSteppable):
                     break
                 if nb in partners:
                     continue
-                self.links.create_link(c, nb, lam=p.tissue_lambda,
-                                       target=p.tissue_target, maxlen=p.tissue_max)
+                new_a.append(c)
+                new_b.append(nb)
                 self._tissue.add(self._key(c, nb))
                 partners.add(nb)
                 link_map.setdefault(nb, set()).add(c)
+        if new_a:  # one allocation for the whole batch (vs O(M) per link)
+            self.links.create_links_bulk(new_a, new_b, lam=p.tissue_lambda,
+                                         target=p.tissue_target, maxlen=p.tissue_max)
         return len(self._tissue)
 
 
@@ -294,6 +305,7 @@ class PassiveSubstrateSteppable(GPUSteppable):
         sub_nb = self._substrate_neighbor_map()
 
         # (a) create a substrate link for passive cells next-to-substrate w/o one
+        new_a, new_b = [], []
         for c in self.passive:
             c = int(c)
             if sl[c] != 0:
@@ -302,21 +314,29 @@ class PassiveSubstrateSteppable(GPUSteppable):
             if sub.size == 0:
                 continue
             target = int(sub.min())  # deterministic pick (see class docstring)
-            self.links.create_link(c, target, lam=p.slink_lambda,
-                                   target=p.slink_target, maxlen=p.slink_max)
+            new_a.append(c)
+            new_b.append(target)
             sl[c] = target
+        if new_a:  # one allocation for the whole batch
+            self.links.create_links_bulk(new_a, new_b, lam=p.slink_lambda,
+                                         target=p.slink_target, maxlen=p.slink_max)
 
-        # (b) Poisson-delete existing substrate links
+        # (b) Poisson-delete existing substrate links (applied AFTER (a), so a link
+        # created this step is eligible for deletion -- matches the original
+        # per-call create-then-delete order)
         have = np.nonzero(sl[self.passive] != 0)[0]
         if have.size:
             cells = self.passive[have]
             dec = _bernoulli(cells.size, p.sub_link_delete_prob, mcs,
                              self.engine.base_seed, _STREAM_SUBLINK, self.engine.device)
+            to_delete = []
             for i, c in enumerate(cells):
                 c = int(c)
                 if dec[i] == 1:
-                    self.links.delete_link(c, int(sl[c]))
+                    to_delete.append((c, int(sl[c])))
                     sl[c] = 0
+            if to_delete:  # one vectorized compaction for the whole batch
+                self.links.delete_links_bulk(to_delete)
 
         self.cell_dict.set("sub_link", sl)
         return int(np.count_nonzero(sl[self.passive]))

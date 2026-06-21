@@ -124,21 +124,64 @@ class FPPLinks:
         self._max = np.asarray(maxlens, np.float32).copy()
         self._dev_dirty = True
 
-    def create_link(self, a: int, b: int, lam=None, target=None, maxlen=None):
-        """Add an undirected link a-b (no dedup; CC3D guards dups at the call
-        site). Effective at the next ``rebuild()``."""
-        self._a = np.append(self._a, np.int32(a))
-        self._b = np.append(self._b, np.int32(b))
-        self._lam = np.append(self._lam, np.float32(self.lambda_default if lam is None else lam))
-        self._tgt = np.append(self._tgt, np.float32(self.target_default if target is None else target))
-        self._max = np.append(self._max, np.float32(self.max_default if maxlen is None else maxlen))
+    def create_links_bulk(self, a, b, lam=None, target=None, maxlen=None):
+        """Append MANY undirected links in a single allocation.
+
+        This is the batched form of ``create_link``: k separate ``create_link``
+        calls each ``np.append`` the whole inventory (O(M) per call -> O(M*k) for a
+        steppable's per-MCS relink loop, the dominant host cost at full Embryo
+        scale). Here the k new links are concatenated once -> O(M + k).
+
+        ``a`` / ``b`` are length-k id arrays. Each per-link param accepts a scalar
+        (broadcast to all k -- the common case, one lambda/target/max for the whole
+        batch), a length-k array, or None (-> the class default). Links are appended
+        in the given order, so a sequence of ``create_link``/``create_links_bulk``
+        calls yields the same inventory as the equivalent single calls. Effective at
+        the next ``rebuild()``."""
+        a = np.ascontiguousarray(a, dtype=np.int32).ravel()
+        b = np.ascontiguousarray(b, dtype=np.int32).ravel()
+        k = a.shape[0]
+        if k == 0:
+            return
+        if b.shape[0] != k:
+            raise ValueError("create_links_bulk: a and b must have equal length")
+
+        def _col(v, default):
+            if v is None:
+                return np.full(k, default, dtype=np.float32)
+            v = np.asarray(v, dtype=np.float32).ravel()
+            if v.shape[0] == 1:                       # scalar -> broadcast to k
+                return np.full(k, float(v[0]), dtype=np.float32)
+            if v.shape[0] != k:
+                raise ValueError("create_links_bulk: per-link param length must be 1 or k")
+            return np.ascontiguousarray(v, dtype=np.float32)
+
+        self._a = np.concatenate([self._a, a])
+        self._b = np.concatenate([self._b, b])
+        self._lam = np.concatenate([self._lam, _col(lam, self.lambda_default)])
+        self._tgt = np.concatenate([self._tgt, _col(target, self.target_default)])
+        self._max = np.concatenate([self._max, _col(maxlen, self.max_default)])
         self._dev_dirty = True
 
-    def delete_link(self, a: int, b: int):
-        """Remove every undirected link matching {a,b} (tombstone -> compacted)."""
-        a, b = int(a), int(b)
-        match = (((self._a == a) & (self._b == b)) | ((self._a == b) & (self._b == a)))
-        if np.any(match):
+    def delete_links_bulk(self, pairs):
+        """Remove EVERY link whose unordered endpoints match any {a,b} in ``pairs``,
+        in one vectorized pass over the inventory.
+
+        The batched form of ``delete_link``: k separate ``delete_link`` calls each
+        scan + recompact the whole inventory (O(M*k) for a per-MCS Poisson-delete
+        loop). Here all k targets are matched with a single ``np.isin`` and one
+        compaction. ``pairs`` is an iterable of (a, b)."""
+        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        if pairs.shape[0] == 0 or self._a.shape[0] == 0:
+            return
+        mult = np.int64(self.n_cells + 2)             # pack {lo,hi} -> one int64 key
+        ea = self._a.astype(np.int64)
+        eb = self._b.astype(np.int64)
+        ekeys = np.minimum(ea, eb) * mult + np.maximum(ea, eb)
+        dkeys = np.unique(np.minimum(pairs[:, 0], pairs[:, 1]) * mult
+                          + np.maximum(pairs[:, 0], pairs[:, 1]))
+        match = np.isin(ekeys, dkeys)
+        if match.any():
             keep = ~match
             self._a = self._a[keep]
             self._b = self._b[keep]
@@ -146,6 +189,21 @@ class FPPLinks:
             self._tgt = self._tgt[keep]
             self._max = self._max[keep]
             self._dev_dirty = True
+
+    def create_link(self, a: int, b: int, lam=None, target=None, maxlen=None):
+        """Add ONE undirected link a-b (no dedup; CC3D guards dups at the call site).
+        Effective at the next ``rebuild()``. Hot per-MCS loops should batch their
+        edits through ``create_links_bulk`` (one allocation instead of O(M) each)."""
+        self.create_links_bulk(
+            [a], [b],
+            lam=None if lam is None else [lam],
+            target=None if target is None else [target],
+            maxlen=None if maxlen is None else [maxlen])
+
+    def delete_link(self, a: int, b: int):
+        """Remove every undirected link matching {a,b}. Hot per-MCS loops should
+        batch their edits through ``delete_links_bulk``."""
+        self.delete_links_bulk([(int(a), int(b))])
 
     @property
     def n_pairs(self) -> int:

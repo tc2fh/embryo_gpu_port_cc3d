@@ -216,11 +216,14 @@ class LamellipodiaSteppable(GPUSteppable):
         dec = CT.poisson_delete_decisions(n_cells=n1, mcs=mcs,
                                           base_seed=self.engine.base_seed,
                                           rate=self.poisson_rate, device=self.engine.device)
+        to_delete = []
         for cell in leaders:
             tgt = int(lt[cell])
             if tgt != 0 and dec[cell] == 1:
-                self.links.delete_link(int(cell), tgt)
+                to_delete.append((int(cell), tgt))
                 lt[cell] = 0
+        if to_delete:  # one vectorized compaction for the whole batch
+            self.links.delete_links_bulk(to_delete)
 
         # --- recreate lamellipodia links for leaders now lacking one ---
         need = {int(c) for c in leaders if int(lt[c]) == 0}

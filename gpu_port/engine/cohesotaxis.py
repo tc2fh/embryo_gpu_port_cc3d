@@ -681,12 +681,16 @@ class CohesotaxisPipeline:
         Returns {cell_id: target_id} for links created."""
         targets = self.select_targets(mcs)
         created = {}
+        new_a, new_b = [], []
         for cell, tgt in targets.items():
             if only_cells is not None and cell not in only_cells:
                 continue
-            links.create_link(cell, tgt, lam=LAMELLIPODIA_LAMBDA,
-                               target=LL_TARGET_DIST, maxlen=LL_MAX_DIST)
+            new_a.append(cell)
+            new_b.append(tgt)
             created[cell] = tgt
+        if new_a:  # one allocation for the whole batch (vs O(M) per link)
+            links.create_links_bulk(new_a, new_b, lam=LAMELLIPODIA_LAMBDA,
+                                    target=LL_TARGET_DIST, maxlen=LL_MAX_DIST)
         return created
 
 
