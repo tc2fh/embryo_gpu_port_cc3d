@@ -25,6 +25,7 @@ from __future__ import annotations
 import numpy as np
 
 import warp as wp
+import warp.utils  # segmented_sort_pairs (on-device per-row CSR sort)
 
 from .config import EngineConfig, neighbor_offsets
 from .state import EngineState
@@ -95,6 +96,12 @@ class GPUEngine:
         self._ht_key = None
         self._ht_count = None
         self._ht_cap = 0
+
+        # on-device CSR compaction scratch (allocated lazily; grown on demand)
+        self._csr_row_counts = None   # per-source degree (n1+1 int32)
+        self._csr_cursor = None       # per-row append cursor (n1+1 int32)
+        self._csr_indices = None      # compact CSR dst ids (>= n_contacts int32)
+        self._csr_data = None         # compact CSR counts  (>= n_contacts int32)
 
     # ---------------------------------------------------------------- FPP attach
     def attach_fpp(self, fpp):
@@ -210,14 +217,26 @@ class GPUEngine:
         return e_vol + e_contact
 
     # ------------------------------------------------ neighbor-contact CSR (hash)
-    def neighbor_contact_csr(self, order: int | None = None):
+    def neighbor_contact_csr(self, order: int | None = None, method: str = "device"):
         """Common-surface-area CSR between cells, built with a device hash over
         directed (self,neighbor) pairs -> O(#contacts) memory (NOT the dense
         (n_cells+1)^2 matrix, which is ~16 GB at 63k cells). Exact: it reproduces
         the dense/CPU directed contact matrix.
 
         Returns ``(indptr, indices, data)`` with indices sorted ascending within
-        each source row, indices including Medium (id 0).
+        each source row, indices including Medium (id 0). dtype int64 (all three).
+
+        ``method`` selects how the device hash table is compacted into the CSR:
+
+        * ``"device"`` (default): compact + sort ON the GPU and transfer only the
+          O(#contacts) result -- a count kernel (per-source degree) -> host cumsum
+          of the tiny per-row degree -> atomic-cursor scatter -> per-row ascending
+          sort. Mirrors the FPP link-CSR build. Avoids copying the cap-sized hash
+          table (~200 MB/MCS at full Embryo scale) and the host ``np.lexsort``.
+        * ``"host"``: the original Phase-3 path -- copy the whole cap-sized table to
+          the host and compact there (boolean mask -> ``np.lexsort`` -> ``np.bincount``).
+          Kept as the reference the device path is asserted byte-equal to, and as a
+          fallback. Produces identical output to ``"device"``.
         """
         if order is None:
             order = self.cfg.tracker_neighbor_order
@@ -254,8 +273,18 @@ class GPUEngine:
             ],
             device=self.device,
         )
-        wp.synchronize()
 
+        if method == "host":
+            return self._compact_csr_host(n1)
+        if method == "device":
+            return self._compact_csr_device(cap, n1)
+        raise ValueError(f"unknown method {method!r}; use 'device' or 'host'")
+
+    def _compact_csr_host(self, n1: int):
+        """Host compaction of the hash table (original Phase-3 path): copy the whole
+        cap-sized table to host and sort/bincount there. The device path's exactness
+        reference."""
+        wp.synchronize()
         key = self._ht_key.numpy()
         cnt = self._ht_count.numpy()
         occ = key >= 0
@@ -271,6 +300,65 @@ class GPUEngine:
         row_counts = np.bincount(src, minlength=n1)[:n1]
         indptr[1:] = np.cumsum(row_counts)
         return indptr, dst.astype(np.int64), data.astype(np.int64)
+
+    def _compact_csr_device(self, cap: int, n1: int):
+        """On-device compaction of the hash table: count -> host cumsum of the tiny
+        per-row degree -> atomic-cursor scatter -> per-row ascending sort. Transfers
+        only the per-row counts (n1 ints) + the compact O(#contacts) CSR. Output is
+        byte-identical to ``_compact_csr_host`` (same ascending-within-row order)."""
+        # scratch (lazy; row_counts/cursor sized n1+1 like the FPP build)
+        if self._csr_row_counts is None or self._csr_row_counts.shape[0] < n1 + 1:
+            self._csr_row_counts = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
+            self._csr_cursor = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
+        self._csr_row_counts.zero_()
+
+        wp.launch(
+            K.neighbor_csr_count_kernel,
+            dim=cap,
+            inputs=[self._ht_key, cap, wp.int64(n1), self._csr_row_counts],
+            device=self.device,
+        )
+        wp.synchronize()
+
+        # exclusive prefix sum of the per-source degree -> indptr (host; n1 is tiny
+        # and off the hot per-flip path -- the FPP-build approach).
+        row_counts = self._csr_row_counts.numpy()[:n1]
+        indptr = np.zeros(n1 + 1, dtype=np.int64)
+        indptr[1:] = np.cumsum(row_counts)
+        n_contacts = int(indptr[-1])
+        if n_contacts == 0:
+            return indptr, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+
+        indptr_dev = wp.array(indptr.astype(np.int32), dtype=wp.int32, device=self.device)
+
+        # compact output buffers (cached, grown on demand). segmented_sort_pairs
+        # double-buffers, so its key/value storage must hold 2*count elements.
+        need = 2 * n_contacts
+        if self._csr_indices is None or self._csr_indices.shape[0] < need:
+            self._csr_indices = wp.zeros(need, dtype=wp.int32, device=self.device)
+            self._csr_data = wp.zeros(need, dtype=wp.int32, device=self.device)
+        self._csr_cursor.zero_()
+
+        wp.launch(
+            K.neighbor_csr_scatter_kernel,
+            dim=cap,
+            inputs=[self._ht_key, self._ht_count, cap, wp.int64(n1),
+                    indptr_dev, self._csr_cursor, self._csr_indices, self._csr_data],
+            device=self.device,
+        )
+        # sort dst ascending WITHIN each source row (co-moving the counts) with a
+        # segmented radix sort. Segments are the CSR rows: segment i spans
+        # [indptr[i], indptr[i+1]) (ends inferred from indptr_dev[1:]). This is
+        # O(#contacts) and handles the highly skewed row sizes -- the Medium row
+        # holds ~every surface cell, which a per-row O(k^2) comparison sort chokes
+        # on (one giant row dominates a single thread).
+        wp.utils.segmented_sort_pairs(self._csr_indices, self._csr_data,
+                                      n_contacts, indptr_dev)
+        wp.synchronize()
+
+        indices = self._csr_indices.numpy()[:n_contacts].astype(np.int64)
+        data = self._csr_data.numpy()[:n_contacts].astype(np.int64)
+        return indptr, indices, data
 
     # ------------------------------------------------------ tracker maintenance
     def recompute_trackers(self):

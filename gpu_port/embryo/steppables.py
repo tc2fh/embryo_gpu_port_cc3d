@@ -84,29 +84,41 @@ def _bernoulli(n, prob, mcs, base_seed, stream, device):
     return dec.numpy()
 
 
-def neighbor_adjacency(engine: GPUEngine, exclude_types=(), csr=None):
+def neighbor_adjacency(engine: GPUEngine, exclude_types=(), csr=None,
+                       cells=None, cell_type=None):
     """Per-cell list of order-1 common-surface neighbor cell ids (excluding Medium
     and any ``exclude_types``), from the engine's scalable hashed neighbor CSR.
 
-    This is the GPU analogue of iterating ``get_cell_neighbor_data_list(cell)``.
-    Returns a list ``adj`` of length n_cells+1; ``adj[c]`` is an int array of
-    neighbor ids. ``csr`` (indptr,indices,data) may be passed to reuse a
-    once-per-MCS build (the EmbryoModel shares one across all tissue steppables).
+    The GPU analogue of iterating ``get_cell_neighbor_data_list(cell)``. Returns a
+    dict ``adj`` mapping cell id -> int64 array of neighbor ids (so ``adj[c]`` works
+    as before).
+
+    ``cells`` -- if given, build adjacency ONLY for those cell ids (the common case:
+    a steppable's ~hundreds of managed cells). This avoids walking all n_cells when
+    only a few are needed -- the dominant cost at full Embryo scale. Defaults to all
+    cells (1..n_cells) for backward compatibility.
+    ``cell_type`` -- pass a cached host copy of the per-cell type vector (it is
+    static) to skip a redundant device->host copy each call.
+    ``csr`` (indptr,indices,data) may be passed to reuse a once-per-MCS build (the
+    EmbryoModel shares one across all tissue steppables).
     """
     if csr is None:
         indptr, indices, _data = engine.neighbor_contact_csr(order=1)
     else:
         indptr, indices, _data = csr
-    cell_type = engine.cell_type.numpy()
-    n1 = engine.n_cells + 1
-    excl = set(int(t) for t in exclude_types)
-    adj = [np.zeros(0, dtype=np.int64) for _ in range(n1)]
-    for c in range(1, n1):
+    if cell_type is None:
+        cell_type = engine.cell_type.numpy()
+    excl = np.array(sorted({int(t) for t in exclude_types}), dtype=cell_type.dtype)
+    if cells is None:
+        cells = range(1, engine.n_cells + 1)
+    adj = {}
+    for c in cells:
+        c = int(c)
         lo, hi = int(indptr[c]), int(indptr[c + 1])
         nb = indices[lo:hi]
-        nb = nb[nb != 0]  # drop Medium
-        if excl:
-            nb = nb[~np.isin(cell_type[nb], list(excl))]
+        nb = nb[nb != 0]                          # drop Medium
+        if excl.size:
+            nb = nb[~np.isin(cell_type[nb], excl)]
         adj[c] = nb.astype(np.int64)
     return adj
 
@@ -137,6 +149,7 @@ class TissueLinkSteppable(GPUSteppable):
         self.cell_types = set(int(t) for t in cell_types)
         self.max_links = params.max_neighbor_num + int(link_cap_offset)
         ctype = engine.cell_type.numpy()
+        self._cell_type = ctype  # static (cells never change type) -> cache, don't re-copy
         self.managed = np.nonzero(np.isin(ctype, list(self.cell_types)))[0].astype(np.int64)
         # set of undirected tissue links we own (so we only Poisson-delete ours, not
         # lamellipodia/substrate links). Stored as frozenset({a,b}).
@@ -148,20 +161,29 @@ class TissueLinkSteppable(GPUSteppable):
         return (a, b) if a < b else (b, a)
 
     def _current_link_map(self):
-        """Map cell -> set of partners over the WHOLE current FPP inventory (all
-        link kinds), used for the per-cell link-count cap + dedup guards."""
-        a = self.links._a
-        b = self.links._b
-        m = {}
-        for i in range(a.shape[0]):
-            ai, bi = int(a[i]), int(b[i])
-            m.setdefault(ai, set()).add(bi)
-            m.setdefault(bi, set()).add(ai)
+        """Map each MANAGED cell -> set of its partners over the WHOLE current FPP
+        inventory (all link kinds), for the per-cell link-count cap + dedup guards.
+
+        Only managed cells are keyed (the only cells queried/updated here), and the
+        links touching them are selected with a vectorized membership mask -- so the
+        cost scales with #links on managed cells, not the full inventory walked in
+        Python. Equivalent to the old all-cells map for every managed-cell lookup."""
+        a = np.asarray(self.links._a, dtype=np.int64)
+        b = np.asarray(self.links._b, dtype=np.int64)
+        m = {int(c): set() for c in self.managed}
+        if a.size:
+            a_man = np.isin(a, self.managed)
+            for ai, bi in zip(a[a_man].tolist(), b[a_man].tolist()):
+                m[ai].add(bi)
+            b_man = np.isin(b, self.managed)
+            for ai, bi in zip(a[b_man].tolist(), b[b_man].tolist()):
+                m[bi].add(ai)
         return m
 
     def start(self):
         adj = neighbor_adjacency(self.engine, exclude_types=(self.substrate_type,),
-                                 csr=self.shared_csr)
+                                 csr=self.shared_csr, cells=self.managed,
+                                 cell_type=self._cell_type)
         link_map = self._current_link_map()
         for c in self.managed:
             c = int(c)
@@ -190,7 +212,8 @@ class TissueLinkSteppable(GPUSteppable):
 
         # --- (2) recreate tissue links to neighbors under the per-cell cap ---
         adj = neighbor_adjacency(self.engine, exclude_types=(self.substrate_type,),
-                                 csr=self.shared_csr)
+                                 csr=self.shared_csr, cells=self.managed,
+                                 cell_type=self._cell_type)
         link_map = self._current_link_map()
         for c in self.managed:
             c = int(c)

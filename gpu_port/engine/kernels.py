@@ -1137,3 +1137,63 @@ def neighbor_contact_hash_kernel(
                 if prev == wp.int64(-1) or prev == key:
                     wp.atomic_add(ht_count, slot, 1)
                     break
+
+
+# ---------------------------------------------------------------------------
+# On-device neighbor-contact CSR compaction (post-Phase-4 perf): turn the hash
+# table (``neighbor_contact_hash_kernel`` output) into a compact CSR sorted
+# ascending within each source row WITHOUT copying the cap-sized table to host.
+# Mirrors the FPP link-CSR build: count per-source degree -> host cumsum ->
+# atomic-cursor scatter -> per-row sort. ``cap`` threads for count/scatter (one
+# per hash slot); ``n1`` threads for the per-row sort (one per source cell).
+# ---------------------------------------------------------------------------
+@wp.kernel
+def neighbor_csr_count_kernel(
+    ht_key: wp.array(dtype=wp.int64),      # packed key src*n1+dst, -1 = empty
+    cap: wp.int32,
+    n_cells_p1: wp.int64,
+    row_counts: wp.array(dtype=wp.int32),  # per-source-row occupied-slot count
+):
+    """One thread per hash slot: for each occupied slot, bump its source row's
+    count (the per-cell out-degree of the directed contact graph)."""
+    i = wp.tid()
+    if i >= cap:
+        return
+    key = ht_key[i]
+    if key < wp.int64(0):
+        return
+    src = wp.int32(key / n_cells_p1)
+    wp.atomic_add(row_counts, src, 1)
+
+
+@wp.kernel
+def neighbor_csr_scatter_kernel(
+    ht_key: wp.array(dtype=wp.int64),
+    ht_count: wp.array(dtype=wp.int32),
+    cap: wp.int32,
+    n_cells_p1: wp.int64,
+    indptr: wp.array(dtype=wp.int32),      # prefix sum of row_counts (n1+1)
+    cursor: wp.array(dtype=wp.int32),      # per-row append cursor (n1), zeroed
+    indices: wp.array(dtype=wp.int32),     # CSR dst ids (n_contacts)
+    data: wp.array(dtype=wp.int32),        # CSR contact counts (n_contacts)
+):
+    """One thread per hash slot: atomic-append each occupied (src,dst,count) into
+    src's CSR range [indptr[src], indptr[src+1])."""
+    i = wp.tid()
+    if i >= cap:
+        return
+    key = ht_key[i]
+    if key < wp.int64(0):
+        return
+    src = wp.int32(key / n_cells_p1)
+    dst = wp.int32(key % n_cells_p1)
+    pos = indptr[src] + wp.atomic_add(cursor, src, 1)
+    indices[pos] = dst
+    data[pos] = ht_count[i]
+
+
+# Within-row ascending sort is done with wp.utils.segmented_sort_pairs over the
+# CSR rows (see GPUEngine._compact_csr_device) -- O(#contacts) and robust to the
+# highly skewed row sizes (the Medium contact row holds ~every surface cell). A
+# per-row comparison-sort kernel was tried and removed: it is O(k^2) per row and
+# that one giant row serialized onto a single thread dominated the whole build.

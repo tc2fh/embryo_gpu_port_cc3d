@@ -211,9 +211,10 @@ class EmbryoModel:
 
     def __init__(self, state, params: EmbryoParams = DEFAULT, device: str = "cuda:0",
                  enable=("lamellipodia", "tissue", "passive_substrate", "closure"),
-                 closure_window=None):
+                 closure_window=None, csr_method: str = "device"):
         self.state = state
         self.params = params
+        self.csr_method = csr_method  # "device" (on-GPU compaction) or "host"
         self.engine = GPUEngine(state, device=device)
         self.links = FPPLinks(self.engine,
                               target_length_default=params.tissue_target,
@@ -258,7 +259,7 @@ class EmbryoModel:
     def _inject_shared_csr(self):
         """Build the order-1 neighbor CSR ONCE and share it with every steppable
         that needs the neighbor relation this MCS (avoids 3-4 redundant rebuilds)."""
-        csr = self.engine.neighbor_contact_csr(order=1)
+        csr = self.engine.neighbor_contact_csr(order=1, method=self.csr_method)
         for key in ("tissue_leading", "tissue_passive", "passive_substrate"):
             s = self.steppables.get(key)
             if s is not None:
