@@ -66,4 +66,32 @@ MANUALLY (same deterministic script) to verify each stop — clean pass. The aut
 normally next session (after a restart). Per the workflow hard rule (stale hook verdict = escalation),
 flagged for review.
 
-## Next: Phase 2 — GPU-native core engine (plan_docs/phase_02_gpu_core_engine.md)
+## Phase 2 — GPU-native core engine — DONE (2026-06-20) — complete
+
+Status: complete; plan_deviation none; escalate=false (verdict: `.phaserun/verdict_phase2.json`).
+Gate: clean (21 tests pass = 7 Phase 1 + 14 Phase 2; in scope; no destructive ops) — run manually.
+Full GPU-resident engine under `gpu_port/engine/` (config, state, kernels, engine, cpu_reference,
+geometry, steppables): int32 id-lattice + per-cell SoA (volume f32, COM as **int64 fixed-point** —
+bit-exact, eliminates the Phase 1 non-reproducibility), 8-color Volume+Contact Metropolis (Philox
+keyed by (mcs,color,seed)), on-GPU volume+COM trackers with EXACT partition asserts, per-MCS
+boundary + neighbor-contact CSR (validated vs CPU), energy/surface observables, a GPU steppable API
+skeleton (CellDict SoA + manager) with a worked non-FPP example, and the Embryo non-FPP `start()`
+geometry — voxel-exact vs `EmbryoSteppables.py` at 63011 cells (60 Leading/618 Passive/62333
+Substrate). Statistical validation GPU vs CPU: volume KS p=0.66; energy/vol/surface/COM all well
+within tolerance. Findings: `gpu_port/phase2/PHASE2_FINDINGS.md`.
+
+Color-scheme decision: default 8-color, flip connectivity capped at NeighborOrder<=3 (enforced in
+EngineConfig); 27-color reachable but unimplemented; order-4 CPU-CC3D physics check deferred to Phase 3.
+
+Carry-forward for Phase 3 (full delta in `.phaserun/verdict_phase2.json`):
+- FPP deltaE must enter at the SAME changePixel/newCell point in `metropolis_color_kernel` (do not
+  restructure the kernel first). The frozen-Medium rule is now engine contract.
+- COM (int64 xsum/ysum/zsum / volume) is the exact, reproducible single source of truth for FPP link
+  length — read directly, no separate tracker.
+- CellDict SoA registry + per-MCS `recompute_trackers()` seam are the FPP-link plug-in points (reuse
+  the Phase 1 atomic-append/compaction CSR pattern).
+- **Scale blocker:** neighbor-CSR currently uses a dense (n_cells+1)^2 device matrix (O(n^2) memory)
+  — MUST move to hashed/segmented CSR before full 63k-cell Embryo runs.
+- Run the order-4 CPU-CC3D ensemble fidelity check (closure free-area, intercalation) — outstanding.
+
+## Next: Phase 3 — GPU FPP + on-device cohesotaxis + full Embryo port (plan_docs/phase_03_gpu_fpp_cohesotaxis_embryo.md)
