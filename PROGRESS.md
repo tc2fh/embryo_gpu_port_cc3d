@@ -434,3 +434,29 @@ kernel launches + per-MCS host view of `_a/_b`); csr_ms +~0.6 ms (int64 indptr c
 it by dropping the CSR host copyback (consume `neighbor_csr_*_dev`), porting steppable create/delete loops to device
 kernels (kills the `_a/_b` host round-trips), and routing Poisson-delete through `compact_with_keep_mask`. NEXT:
 `plan_docs/phase_07_device_link_steppables.md` (Objective items 1-4 + Delivery discipline).
+
+## Phase 7 — device tissue/substrate/Poisson link steppables + dropped CSR copyback — DONE (complete) 2026-06-21
+
+Orchestrated per `.claude/workflow.md` (executor=Opus, summarizer=Sonnet). Gate CLEAN: 205 passed / 3 skip (was 191/3;
++14 phase-7 tests), 7 files / 878 lines, in-scope (`gpu_port/engine/` + `embryo/` + `phase7/`), non-destructive. Verdict:
+complete / minor / no escalate. **PERF RECLAIMED** (full 100^3, device backend): csr_ms 3.5→1.0 (host copyback gone),
+steppable_ms 13.2→6.3, MCS/s 55→128 (**2.3×**). Delivered: (1) tissue links on device — `gpu_port/engine/link_kernels.py`
+`tissue_relink_serial_kernel` (single-thread greedy over cells in ascending id, scans each neighbor-CSR row in CSR-row
+order, claims tissue links up to the per-cell degree cap; serial is REQUIRED — cross-cell degree-budget dependency — and
+faithful to `EmbryoSteppables` order; proven byte-exact-SET vs host where the cap binds) + device-native
+`FPPLinks.create_links_bulk_device` (no host round-trip) + `tissue_relink_device`; (2) substrate min-id create kernel +
+Poisson deletes routed through Phase-6 `compact_with_keep_mask` for all three kinds (`poisson_keep_mask_kernel` keyed by
+stable `{a,b}` pair; lamellipodia keyed by leader id via the existing cohesotaxis Philox); (3) copyback dropped —
+`engine.publish_neighbor_csr_device` / `neighbor_contact_csr(host_return=False)` publishes only resident handles + reads
+scalar `indptr[-1]`; `EmbryoModel._inject_shared_csr` uses device mode. Host path preserved behind a `link_backend` flag
+("device" default = hot path / "host" = differential tests). Tests: device-vs-host tissue+substrate link SET equality
+with the cap binding (both managers), Poisson rate ≈`1-exp(-rate)` + per-key reproducibility, kind-isolated keep/compact,
+full-Embryo inventory + link-length mean/median/KS within Phase-3 tolerances, an assertion of ZERO hot-path full-graph
+copyback, and an IN-GATE real-CC3D 100^3 cross-check run in an isolated subprocess (avoids a second in-process CC3D
+crash; skips stay at the 3 sanctioned ones). DEVIATIONS (all minor/none): serial cap kernel (load-bearing, not a
+shortcut); tissue Poisson delete owned by the Leading manager only (avoids double-rating the shared inventory; rate
+validated); Poisson re-keyed to `{a,b}` (spec-endorsed); no full-lattice bit-repro assertion (spec asks statistical match
+only; pre-existing FPP COM-read race). **LEFT FOR PHASE 8**: residual ~4 ms steppable = the lamellipodia
+cohesotaxis-CREATE pipeline (host per-cell prefix-sum SigWeights) still host-side; the batched R-replica loops still
+host-side; the FPP COM-read race remains an open item (do NOT assume bit-exact `EmbryoModel.run` replay). NEXT:
+`plan_docs/phase_08_cohesotaxis_fusion_batched_collapse.md`.

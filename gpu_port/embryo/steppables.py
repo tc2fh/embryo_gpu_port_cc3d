@@ -169,21 +169,39 @@ class TissueLinkSteppable(GPUSteppable):
     Passive (``MaxNeighborNum``), matching the two call sites.
     """
 
+    # cap "off" sentinel for start() (CC3D start creates a link to EVERY non-substrate
+    # neighbor lacking one -- NO MaxNeighborNum cap; the cap is only applied in step()).
+    _NO_CAP = 1 << 30
+
     def __init__(self, engine: GPUEngine, links, cell_types, params: EmbryoParams = DEFAULT,
-                 link_cap_offset: int = 1, substrate_type: int = 4, frequency: int = 1):
+                 link_cap_offset: int = 1, substrate_type: int = 4, frequency: int = 1,
+                 link_backend: str = "host", device_poisson_delete: bool = True):
         super().__init__(engine, frequency)
         self.links = links
         self.p = params
         self.substrate_type = int(substrate_type)
         self.cell_types = set(int(t) for t in cell_types)
         self.max_links = params.max_neighbor_num + int(link_cap_offset)
+        self.link_backend = link_backend  # "device" (no copyback) or "host" (tests)
+        # DEVICE path only: whether THIS manager runs the per-MCS tissue Poisson delete.
+        # Tissue links are matched by lambda over the SHARED inventory, so exactly one
+        # tissue manager must own the delete (else every tissue link gets one draw PER
+        # manager -> the effective rate doubles). The Leading manager owns it; the
+        # Passive manager only recreates. Net per-MCS effect (delete-then-refill) is
+        # identical to the host's per-manager delete since recreate always follows.
+        self.device_poisson_delete = bool(device_poisson_delete)
         ctype = engine.cell_type.numpy()
         self._cell_type = ctype  # static (cells never change type) -> cache, don't re-copy
         self.managed = np.nonzero(np.isin(ctype, list(self.cell_types)))[0].astype(np.int64)
+        # managed ids as an ASCENDING device int32 array (the serial relink kernel
+        # processes them in id order -> the load-bearing cap-truncation order).
+        self.managed_dev = wp.array(
+            np.sort(self.managed).astype(np.int32), dtype=wp.int32, device=engine.device)
+        self.n_managed = int(self.managed.shape[0])
         # set of undirected tissue links we own (so we only Poisson-delete ours, not
-        # lamellipodia/substrate links). Stored as frozenset({a,b}).
+        # lamellipodia/substrate links). Stored as frozenset({a,b}). (HOST path only.)
         self._tissue = set()
-        # optional once-per-MCS shared neighbor CSR (set by EmbryoModel)
+        # optional once-per-MCS shared neighbor CSR (set by EmbryoModel) (HOST path).
         self.shared_csr = None
 
     def _key(self, a, b):
@@ -210,6 +228,48 @@ class TissueLinkSteppable(GPUSteppable):
         return m
 
     def start(self):
+        if self.link_backend == "device":
+            return self._start_device()
+        return self._start_host()
+
+    def step(self, mcs: int):
+        if self.link_backend == "device":
+            return self._step_device(mcs)
+        return self._step_host(mcs)
+
+    # ------------------------------------------------------------- device path
+    def _start_device(self):
+        """CC3D start(): create a tissue link to every non-Substrate order-1 neighbor
+        lacking one -- NO cap (the cap is only applied in step()). Runs entirely on
+        device from the engine's resident order-1 neighbor CSR handles + the device
+        inventory (no host CSR copyback, no Python per-cell loop)."""
+        self.links.tissue_relink_device(
+            self.engine, self.managed_dev, self.n_managed, cap=self._NO_CAP,
+            substrate_type=self.substrate_type, lam=self.p.tissue_lambda,
+            target=self.p.tissue_target, maxlen=self.p.tissue_max)
+        return self.links.n_pairs
+
+    def _step_device(self, mcs: int):
+        """CC3D step(): Poisson-delete each tissue link with prob 1-exp(-TissueRate)
+        (intercalation), then recreate tissue links to neighbors under the per-cell
+        cap (MaxNeighborNum[+1], all kinds counted, CSR-row order). Both on device."""
+        p = self.p
+        # (1) Poisson-delete tissue links via the device keep-mask + compact (the
+        # Phase-6 keep/compact seam) -- no host to_delete set. Only the owning manager
+        # (Leading) draws, so each tissue link gets exactly one draw per MCS.
+        if self.device_poisson_delete:
+            self.links.poisson_delete_device(
+                p.tissue_lambda, p.tissue_delete_prob, mcs,
+                self.engine.base_seed, _STREAM_TISSUE)
+        # (2) cap-ordered recreate from the device CSR handles + inventory.
+        self.links.tissue_relink_device(
+            self.engine, self.managed_dev, self.n_managed, cap=self.max_links,
+            substrate_type=self.substrate_type, lam=p.tissue_lambda,
+            target=p.tissue_target, maxlen=p.tissue_max)
+        return self.links.n_pairs
+
+    # ------------------------------------------------------------- host path
+    def _start_host(self):
         adj = neighbor_adjacency(self.engine, exclude_types=(self.substrate_type,),
                                  csr=self.shared_csr, cells=self.managed,
                                  cell_type=self._cell_type)
@@ -231,7 +291,7 @@ class TissueLinkSteppable(GPUSteppable):
                                          target=self.p.tissue_target, maxlen=self.p.tissue_max)
         return len(self._tissue)
 
-    def step(self, mcs: int):
+    def _step_host(self, mcs: int):
         p = self.p
         # --- (1) Poisson-delete each existing tissue link (intercalation) ---
         tissue_list = list(self._tissue)
@@ -291,16 +351,21 @@ class PassiveSubstrateSteppable(GPUSteppable):
     """
 
     def __init__(self, engine: GPUEngine, links, passive_type: int = 2,
-                 substrate_type: int = 4, params: EmbryoParams = DEFAULT, frequency: int = 1):
+                 substrate_type: int = 4, params: EmbryoParams = DEFAULT, frequency: int = 1,
+                 link_backend: str = "host"):
         super().__init__(engine, frequency)
         self.links = links
         self.p = params
         self.passive_type = int(passive_type)
         self.substrate_type = int(substrate_type)
+        self.link_backend = link_backend  # "device" (no copyback) or "host" (tests)
         ctype = engine.cell_type.numpy()
         self._cell_type = ctype  # static (cells never change type) -> cache, don't re-copy
         self.passive = np.nonzero(ctype == self.passive_type)[0].astype(np.int64)
-        self.cell_dict.register("sub_link", "int32", 0)  # cell.dict['link'] mirror
+        self.passive_dev = wp.array(
+            self.passive.astype(np.int32), dtype=wp.int32, device=engine.device)
+        self.n_passive = int(self.passive.shape[0])
+        self.cell_dict.register("sub_link", "int32", 0)  # cell.dict['link'] mirror (HOST)
         self.shared_csr = None
 
     def _substrate_neighbor_map(self):
@@ -326,6 +391,34 @@ class PassiveSubstrateSteppable(GPUSteppable):
     def step(self, mcs: int):
         if not self.p.if_passive_substrate:
             return 0
+        if self.link_backend == "device":
+            return self._step_device(mcs)
+        return self._step_host(mcs)
+
+    # ------------------------------------------------------------- device path
+    def _step_device(self, mcs: int):
+        """CC3D PassiveSteppable substrate dynamics on device: (a) create a substrate
+        link (to the smallest-id Substrate neighbor) for each passive cell next to the
+        Substrate without one, then (b) Poisson-delete substrate links with prob
+        1-exp(-SubLinkRate). 'Has a substrate link' is derived from the inventory (no
+        side SoA); the delete routes through the device keep-mask + compact. Order is
+        create-then-delete (matches the host: a link made this step is delete-eligible
+        this step)."""
+        p = self.p
+        # (a) create min-id substrate links for passive cells lacking one
+        self.links.substrate_relink_device(
+            self.engine, self.passive_dev, self.n_passive,
+            substrate_type=self.substrate_type, slink_lambda=p.slink_lambda,
+            slink_target=p.slink_target, slink_max=p.slink_max)
+        # (b) Poisson-delete substrate links (keyed by the link's stable pair key)
+        self.links.poisson_delete_device(
+            p.slink_lambda, p.sub_link_delete_prob, mcs,
+            self.engine.base_seed, _STREAM_SUBLINK)
+        # count is derived from the inventory on demand (no SoA); return live count.
+        return self.links.n_pairs
+
+    # ------------------------------------------------------------- host path
+    def _step_host(self, mcs: int):
         p = self.p
         sl = self.cell_dict.get("sub_link")
         sub_nb = self._substrate_neighbor_map()

@@ -51,6 +51,7 @@ import warp as wp
 
 from . import kernels as K
 from . import scan as S
+from . import link_kernels as LK
 
 wp.init()
 
@@ -302,6 +303,203 @@ class FPPLinks:
         wp.copy(self._max_dev[base:base + k], wp.array(mx, dtype=wp.float32, device=self.device))
         self._m = base + k
         self._invalidate_host()
+
+    # ----------------------------------------------------- Phase 7 device link mgmt
+    def _link_scratch(self):
+        """Lazily-built per-engine device scratch for the Phase-7 link kernels."""
+        sc = getattr(self, "_lk_scratch", None)
+        if sc is None:
+            sc = LK._LinkScratch(self.device, self.n1)
+            self._lk_scratch = sc
+        return sc
+
+    def create_links_bulk_device(self, a_dev, b_dev, k: int, lam, target, maxlen):
+        """Append ``k`` device-resident claims (``a_dev``/``b_dev`` int32, only
+        ``[0:k]`` read) as a contiguous inventory block with broadcast scalar params --
+        the Phase-7 device-native create that avoids the device->host->device round-trip
+        ``create_links_bulk`` paid (it took host pair-lists). Order-preserving (block
+        append at ``[_m,_m+k)``), so the inventory layout stays stable. ``k`` is the
+        only host scalar read by the caller."""
+        k = int(k)
+        if k <= 0:
+            return
+        base = self._m
+        self._ensure_capacity(base + k)
+        wp.launch(
+            LK.append_block_kernel,
+            dim=k,
+            inputs=[a_dev, b_dev, k, base,
+                    float(lam), float(target), float(maxlen),
+                    self._a_dev, self._b_dev, self._lam_dev, self._tgt_dev, self._max_dev],
+            device=self.device,
+        )
+        self._m = base + k
+        self._invalidate_host()
+
+    def inventory_degree_dev(self, out=None):
+        """Per-cell degree over the WHOLE current inventory (all kinds, both
+        endpoints) on device -> (n1,) int32. The tissue cap budget base. Reuses the
+        scratch ``degree`` buffer unless ``out`` is given."""
+        sc = self._link_scratch()
+        deg = sc.degree if out is None else out
+        deg.zero_()
+        if self._m > 0:
+            wp.launch(LK.inventory_degree_kernel, dim=self._m,
+                      inputs=[self._a_dev, self._b_dev, self._m, deg],
+                      device=self.device)
+        return deg
+
+    def tissue_relink_device(self, engine, managed_dev, n_managed: int, cap: int,
+                             substrate_type: int, lam: float, target: float,
+                             maxlen: float):
+        """Device port of the tissue cap-ordered relink (CC3D ``Leading``/``Passive``
+        neighbor-link creation). Reads the engine's resident order-1 neighbor CSR
+        handles (``neighbor_csr_indptr_dev`` / ``neighbor_csr_indices_dev``) + the
+        device inventory; appends the claimed links. The cap-truncation order matches
+        CC3D exactly (managed cells ascending, each scanning its CSR row ascending,
+        cap re-checked per neighbor, all link kinds counted, intra-pass visibility).
+        Returns the number of links created."""
+        if n_managed <= 0 or engine.neighbor_csr_indptr_dev is None:
+            return 0
+        sc = self._link_scratch()
+        mult = np.int64(self.n_cells + 2)
+        # live degree = full inventory degree (mutated in-kernel as links are claimed)
+        live = sc.degree
+        self.inventory_degree_dev(out=live)
+        # membership set: inventory keys + headroom for this pass's claims. Each claim
+        # is a distinct neighbor-CSR edge, so the new-link count is bounded by the
+        # contact count -- use that (the cap may be "effectively infinite" for start(),
+        # so n_managed*cap would overflow; n_contacts is the real upper bound).
+        n_contacts = int(getattr(engine, "neighbor_csr_n_contacts", 0))
+        prod = int(n_managed) * int(cap)
+        if prod < 0 or prod > n_contacts:
+            prod = n_contacts
+        max_new = max(1, prod)
+        table, tab_cap = sc.table(self._m + max_new)
+        table.fill_(wp.int64(-1))
+        if self._m > 0:
+            wp.launch(LK.inventory_hash_fill_kernel, dim=self._m,
+                      inputs=[self._a_dev, self._b_dev, self._m,
+                              wp.int64(int(mult)), int(tab_cap), table],
+                      device=self.device)
+        out_a, out_b = sc.claims(max(1, max_new))
+        sc._count.zero_()
+        wp.launch(
+            LK.tissue_relink_serial_kernel,
+            dim=1,
+            inputs=[managed_dev, int(n_managed), int(cap), int(substrate_type),
+                    engine.cell_type, engine.neighbor_csr_indptr_dev,
+                    engine.neighbor_csr_indices_dev, live, table, int(tab_cap),
+                    wp.int64(int(mult)), out_a, out_b, sc._count],
+            device=self.device,
+        )
+        wp.synchronize()
+        k = int(sc._count.numpy()[0])         # scalar readback (not the graph)
+        if k > 0:
+            self.create_links_bulk_device(out_a, out_b, k, lam, target, maxlen)
+        return k
+
+    def substrate_relink_device(self, engine, passive_dev, n_passive: int,
+                                substrate_type: int, slink_lambda: float,
+                                slink_target: float, slink_max: float):
+        """Device port of ``PassiveSubstrateSteppable`` create: for each passive cell
+        with no substrate link (derived from the inventory), claim a link to its
+        smallest-id Substrate order-1 neighbor. Returns the number created."""
+        if n_passive <= 0 or engine.neighbor_csr_indptr_dev is None:
+            return 0
+        sc = self._link_scratch()
+        has = sc.has_link
+        has.zero_()
+        if self._m > 0:
+            wp.launch(LK.substrate_has_link_kernel, dim=self._m,
+                      inputs=[self._a_dev, self._b_dev, self._lam_dev, self._m,
+                              float(slink_lambda), engine.cell_type, int(substrate_type),
+                              has],
+                      device=self.device)
+        # one emit-or-nothing per passive cell, then compact to a dense claim block
+        emit_a, emit_b = sc.claims(max(1, int(n_passive)))
+        emit_a.fill_(wp.int32(-1))
+        wp.launch(
+            LK.substrate_link_create_kernel,
+            dim=int(n_passive),
+            inputs=[passive_dev, int(n_passive), has, engine.cell_type,
+                    int(substrate_type), engine.neighbor_csr_indptr_dev,
+                    engine.neighbor_csr_indices_dev, emit_a, emit_b],
+            device=self.device,
+        )
+        # compact emitted pairs (exclusive scan of the emit flag -> dense positions)
+        np_ = int(n_passive)
+        flag = sc.subflag(np_)
+        wp.launch(LK.emit_flag_kernel, dim=np_,
+                  inputs=[emit_a, np_, flag], device=self.device)
+        pos = sc.subpos(np_)
+        wp.utils.array_scan(flag[0:np_], pos[0:np_], False)
+        dense_a, dense_b = sc.subclaims(np_)
+        wp.launch(LK.compact_pairs_kernel, dim=np_,
+                  inputs=[emit_a, emit_b, np_, pos, dense_a, dense_b],
+                  device=self.device)
+        wp.synchronize()
+        k = int(flag[0:np_].numpy().sum())   # scalar count (n_passive ints, not the graph)
+        if k > 0:
+            self.create_links_bulk_device(dense_a, dense_b, k, slink_lambda,
+                                          slink_target, slink_max)
+        return k
+
+    def poisson_delete_device(self, kind_lambda: float, prob: float, mcs: int,
+                              base_seed: int, stream: int):
+        """Poisson-delete links of ONE kind (matched by ``kind_lambda``) via a device
+        keep-mask + ``compact_with_keep_mask`` (Phase 6's keep/compact). Bernoulli is
+        keyed by (mcs, stable-unordered-{a,b}, stream, base_seed). Returns the new
+        inventory size."""
+        if self._m == 0:
+            return 0
+        sc = self._link_scratch()
+        keep = sc.keep(self._m)
+        wp.launch(
+            LK.poisson_keep_mask_kernel,
+            dim=self._m,
+            inputs=[self._a_dev, self._b_dev, self._lam_dev, self._m,
+                    float(kind_lambda), float(prob), int(mcs), int(base_seed),
+                    int(stream), keep],
+            device=self.device,
+        )
+        return self.compact_with_keep_mask(keep)
+
+    def poisson_delete_device_by_cell(self, kind_lambda: float, prob: float, mcs: int,
+                                      base_seed: int, engine, substrate_type: int):
+        """Poisson-delete links of a (managed-cell, Substrate) kind (e.g. lamellipodia),
+        keyed by the NON-Substrate endpoint id with the cohesotaxis per-cell Philox
+        formula -> reproduces the prior per-leader delete decisions exactly, via the
+        device keep-mask + compact. Returns the new inventory size."""
+        if self._m == 0:
+            return 0
+        sc = self._link_scratch()
+        keep = sc.keep(self._m)
+        wp.launch(
+            LK.poisson_keep_mask_by_cell_kernel,
+            dim=self._m,
+            inputs=[self._a_dev, self._b_dev, self._lam_dev, self._m,
+                    float(kind_lambda), engine.cell_type, int(substrate_type),
+                    float(prob), int(mcs), int(base_seed), keep],
+            device=self.device,
+        )
+        return self.compact_with_keep_mask(keep)
+
+    def cells_with_kind_link(self, kind_lambda: float, engine, substrate_type: int):
+        """Device per-cell flag (n1,) int32: 1 if the managed (non-Substrate) endpoint
+        owns a link of ``kind_lambda`` in the current inventory. The device-native
+        replacement for the host ``link_target`` SoA (derive 'has a lamellipodia link'
+        from the inventory). Returns the device array (reuses scratch)."""
+        sc = self._link_scratch()
+        has = sc.has_link
+        has.zero_()
+        if self._m > 0:
+            wp.launch(LK.cell_has_kind_link_kernel, dim=self._m,
+                      inputs=[self._a_dev, self._b_dev, self._lam_dev, self._m,
+                              float(kind_lambda), engine.cell_type, int(substrate_type),
+                              has],
+                      device=self.device)
+        return has
 
     def delete_links_bulk(self, pairs):
         """Remove EVERY link whose unordered endpoints match any {a,b} in ``pairs``,

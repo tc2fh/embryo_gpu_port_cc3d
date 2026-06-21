@@ -180,18 +180,25 @@ class LamellipodiaSteppable(GPUSteppable):
 
     def __init__(self, engine: GPUEngine, links, leading_type: int,
                  substrate_type: int, passive_type: int,
-                 lamellipodia_distance: int | None = None, frequency: int = 1):
+                 lamellipodia_distance: int | None = None, frequency: int = 1,
+                 link_backend: str = "host"):
         super().__init__(engine, frequency)
         from . import cohesotaxis as CT
         self._CT = CT
         self.links = links
+        self.leading_type = int(leading_type)
+        self.substrate_type = int(substrate_type)
+        self.link_backend = link_backend  # "device" (no copyback) or "host" (tests)
         ld = CT.LAMELLIPODIA_DISTANCE if lamellipodia_distance is None else lamellipodia_distance
         self.pipe = CT.CohesotaxisPipeline(
             engine, leading_type=leading_type, substrate_type=substrate_type,
             passive_type=passive_type, lamellipodia_distance=ld)
         # cell.dict['link'] equivalent: substrate id each leader is linked to (0=none)
+        # (HOST path only; the device path derives 'has a link' from the inventory)
         self.cell_dict.register("link_target", "int32", 0)
         self.poisson_rate = CT.LAMELLAE_RATE
+        self.lamellipodia_lambda = CT.LAMELLIPODIA_LAMBDA
+        self.lamellae_delete_prob = float(1.0 - np.exp(-self.poisson_rate))
 
     def _leaders(self):
         return self.pipe.lead_ids
@@ -207,6 +214,33 @@ class LamellipodiaSteppable(GPUSteppable):
         return created
 
     def step(self, mcs: int):
+        if self.link_backend == "device":
+            return self._step_device(mcs)
+        return self._step_host(mcs)
+
+    # ------------------------------------------------------------- device path
+    def _step_device(self, mcs: int):
+        """Lamellipodia turnover with NO host link round-trip: Poisson-delete existing
+        lamellipodia links via the device keep-mask + compact (keyed per leader cell,
+        the same decisions as the host path), then recreate for leaders now lacking a
+        link -- the 'need' set derived from the inventory (not a host SoA). The
+        cohesotaxis create pipeline is already on-device."""
+        # --- device Poisson delete (keep/compact seam), per-leader keyed ---
+        self.links.poisson_delete_device_by_cell(
+            self.lamellipodia_lambda, self.lamellae_delete_prob, mcs,
+            self.engine.base_seed, self.engine, self.substrate_type)
+        # --- recreate for leaders that now lack a lamellipodia link ---
+        has = self.links.cells_with_kind_link(
+            self.lamellipodia_lambda, self.engine, self.substrate_type)
+        leaders = self._leaders()
+        has_host = has.numpy()                 # (n1,) ints -- a per-cell flag, not the graph
+        need = {int(c) for c in leaders if has_host[int(c)] == 0}
+        if need:
+            self.pipe.create_lamellipodia_links(self.links, mcs=mcs, only_cells=need)
+        return int(self.links.n_pairs)
+
+    # ------------------------------------------------------------- host path
+    def _step_host(self, mcs: int):
         CT = self._CT
         lt = self.cell_dict.get("link_target")
         leaders = self._leaders()

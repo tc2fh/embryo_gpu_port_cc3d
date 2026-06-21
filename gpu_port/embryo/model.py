@@ -211,10 +211,16 @@ class EmbryoModel:
 
     def __init__(self, state, params: EmbryoParams = DEFAULT, device: str = "cuda:0",
                  enable=("lamellipodia", "tissue", "passive_substrate", "closure"),
-                 closure_window=None, csr_method: str = "device"):
+                 closure_window=None, csr_method: str = "device",
+                 link_backend: str = "device"):
         self.state = state
         self.params = params
         self.csr_method = csr_method  # "device" (on-GPU compaction) or "host"
+        # Phase 7: "device" = port the link create/delete loops to device kernels that
+        # read the resident neighbor-CSR handles + device inventory directly and DROP
+        # the per-MCS host CSR copyback; "host" = the Phase-3 host loops (kept behind
+        # this flag for the differential link-set tests).
+        self.link_backend = link_backend
         self.engine = GPUEngine(state, device=device)
         self.links = FPPLinks(self.engine,
                               target_length_default=params.tissue_target,
@@ -225,22 +231,29 @@ class EmbryoModel:
         self.enable = set(enable)
         self.steppables = {}
 
+        lb = self.link_backend
         if "lamellipodia" in self.enable:
             s = LamellipodiaSteppable(
                 self.engine, self.links, leading_type=LEADING, substrate_type=SUBSTRATE,
-                passive_type=PASSIVE, lamellipodia_distance=params.lamellipodia_distance)
+                passive_type=PASSIVE, lamellipodia_distance=params.lamellipodia_distance,
+                link_backend=lb)
             self.manager.register(s)
             self.steppables["lamellipodia"] = s
         if "tissue" in self.enable:
             # Leading uses MaxNeighborNum+1 cap; Passive uses MaxNeighborNum. CC3D
             # has both; here both Leading+Passive get tissue links. Use the Leading
             # (+1) cap for leaders and the Passive cap for passives via two managers.
+            # In device mode ONLY the Leading manager runs the tissue Poisson delete
+            # over the shared inventory (one draw per tissue link per MCS); Passive
+            # only recreates (see TissueLinkSteppable.device_poisson_delete).
             s_lead = TissueLinkSteppable(
                 self.engine, self.links, cell_types=(LEADING,), params=params,
-                link_cap_offset=1, substrate_type=SUBSTRATE)
+                link_cap_offset=1, substrate_type=SUBSTRATE, link_backend=lb,
+                device_poisson_delete=True)
             s_pas = TissueLinkSteppable(
                 self.engine, self.links, cell_types=(PASSIVE,), params=params,
-                link_cap_offset=0, substrate_type=SUBSTRATE)
+                link_cap_offset=0, substrate_type=SUBSTRATE, link_backend=lb,
+                device_poisson_delete=False)
             self.manager.register(s_lead)
             self.manager.register(s_pas)
             self.steppables["tissue_leading"] = s_lead
@@ -248,7 +261,7 @@ class EmbryoModel:
         if "passive_substrate" in self.enable:
             s = PassiveSubstrateSteppable(
                 self.engine, self.links, passive_type=PASSIVE, substrate_type=SUBSTRATE,
-                params=params)
+                params=params, link_backend=lb)
             self.manager.register(s)
             self.steppables["passive_substrate"] = s
         if "closure" in self.enable:
@@ -257,8 +270,17 @@ class EmbryoModel:
             self.steppables["closure"] = s
 
     def _inject_shared_csr(self):
-        """Build the order-1 neighbor CSR ONCE and share it with every steppable
-        that needs the neighbor relation this MCS (avoids 3-4 redundant rebuilds)."""
+        """Build the order-1 neighbor CSR ONCE per MCS and make it available to the
+        steppables that need the neighbor relation.
+
+        DEVICE backend (Phase 7): publish ONLY the resident device CSR handles
+        (``engine.neighbor_csr_*_dev``) -- the steppable device kernels read those
+        directly, so the whole contact graph is NEVER copied back to the host on the
+        hot path (the copyback this phase removes). HOST backend: build + copy the host
+        CSR arrays (the Phase-3 path) and share them, for the differential tests."""
+        if self.link_backend == "device":
+            self.engine.publish_neighbor_csr_device(order=1)
+            return
         csr = self.engine.neighbor_contact_csr(order=1, method=self.csr_method)
         for key in ("tissue_leading", "tissue_passive", "passive_substrate"):
             s = self.steppables.get(key)

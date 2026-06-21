@@ -229,7 +229,25 @@ class GPUEngine:
         return e_vol + e_contact
 
     # ------------------------------------------------ neighbor-contact CSR (hash)
-    def neighbor_contact_csr(self, order: int | None = None, method: str = "device"):
+    def publish_neighbor_csr_device(self, order: int | None = None):
+        """Build the neighbor-contact CSR and publish ONLY the resident device
+        handles (``neighbor_csr_indptr_dev`` / ``neighbor_csr_indices_dev`` /
+        ``neighbor_csr_data_dev`` / ``neighbor_csr_n_contacts``) -- the Phase-7
+        hot-path entry that DROPS the per-MCS host copyback.
+
+        Identical device work to ``neighbor_contact_csr(method="device")`` (same hash
+        kernel, same on-device compaction + global radix sort), but it never copies
+        the O(#contacts) ``indices``/``data`` (the whole contact graph) back to the
+        host -- only a single scalar (``indptr[-1]`` == n_contacts) is read so the
+        caller can size things. Returns ``n_contacts``. Used by ``EmbryoModel`` in
+        device link-backend mode; the host steppable path still uses
+        ``neighbor_contact_csr`` (host arrays) behind its flag for the differential
+        tests."""
+        return self.neighbor_contact_csr(order=order, method="device",
+                                         host_return=False)
+
+    def neighbor_contact_csr(self, order: int | None = None, method: str = "device",
+                             host_return: bool = True):
         """Common-surface-area CSR between cells, built with a device hash over
         directed (self,neighbor) pairs -> O(#contacts) memory (NOT the dense
         (n_cells+1)^2 matrix, which is ~16 GB at 63k cells). Exact: it reproduces
@@ -289,7 +307,7 @@ class GPUEngine:
         if method == "host":
             return self._compact_csr_host(n1)
         if method == "device":
-            return self._compact_csr_device(cap, n1)
+            return self._compact_csr_device(cap, n1, host_return=host_return)
         raise ValueError(f"unknown method {method!r}; use 'device' or 'host'")
 
     def _compact_csr_host(self, n1: int):
@@ -313,14 +331,20 @@ class GPUEngine:
         indptr[1:] = np.cumsum(row_counts)
         return indptr, dst.astype(np.int64), data.astype(np.int64)
 
-    def _compact_csr_device(self, cap: int, n1: int):
+    def _compact_csr_device(self, cap: int, n1: int, host_return: bool = True):
         """On-device compaction of the hash table: count per-source degree -> host
         cumsum -> stream occupied (packed-key, count) into dense arrays -> ONE global
         radix sort on the int64 packed key src*n1+dst. Ascending key == ascending
         (src, dst) (dst < n1), so the single sort yields the CSR layout directly --
         no segmented sort over n1 tiny skewed rows. Transfers only the per-row counts
         (n1 ints) + the compact O(#contacts) result. Byte-identical to
-        ``_compact_csr_host`` (same ascending-within-row order)."""
+        ``_compact_csr_host`` (same ascending-within-row order).
+
+        ``host_return`` (Phase 7): when False, publish the resident device handles but
+        SKIP the O(#contacts) ``indices``/``data`` host copies (the per-MCS contact-
+        graph copyback this phase removes) and skip the full ``indptr`` copy -- only
+        ``indptr[-1]`` (a scalar) is read for n_contacts. Returns ``n_contacts``
+        instead of the host triple."""
         # scratch (lazy; row_counts/cursor sized n1+1 like the FPP build)
         if self._csr_row_counts is None or self._csr_row_counts.shape[0] < n1 + 1:
             self._csr_row_counts = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
@@ -343,14 +367,23 @@ class GPUEngine:
         S.exclusive_scan_to_ptr_i64(self._csr_row_counts, n1, self._csr_indptr_dev,
                                     self.device)
         wp.synchronize()
-        indptr = self._csr_indptr_dev.numpy()
-        n_contacts = int(indptr[-1])
+        # n_contacts == indptr[-1]. host_return path copies the whole (n1+1) indptr
+        # back (cheap, the Phase-6 contract); device-only path reads just the last
+        # element (a scalar) so it never copies an O(n_cells) array on the hot path.
+        if host_return:
+            indptr = self._csr_indptr_dev.numpy()
+            n_contacts = int(indptr[-1])
+        else:
+            indptr = None
+            n_contacts = int(self._csr_indptr_dev[n1:n1 + 1].numpy()[0])
         if n_contacts == 0:
             empty = wp.zeros(0, dtype=wp.int32, device=self.device)
             self.neighbor_csr_indptr_dev = self._csr_indptr_dev
             self.neighbor_csr_indices_dev = empty
             self.neighbor_csr_data_dev = empty
             self.neighbor_csr_n_contacts = 0
+            if not host_return:
+                return 0
             return indptr, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
 
         # dense sort buffers (cached, grown on demand). radix_sort_pairs double-
@@ -383,19 +416,22 @@ class GPUEngine:
             inputs=[self._csr_keys, n_contacts, wp.int64(n1), self._csr_indices],
             device=self.device,
         )
-        wp.synchronize()
 
-        indices = self._csr_indices.numpy().astype(np.int64)               # Medium 0 included
-        data = self._csr_data[:n_contacts].numpy().astype(np.int64)        # slice off the 2x buffer
-
-        # publish the resident device handles (Phase 6 deliverable 2). These are
-        # exactly the arrays the host return is .numpy()'d from: indptr int64
-        # (n1+1), indices int32 (n_contacts), data int32 (n_contacts, sliced off the
-        # 2x radix double-buffer). The host return above is unchanged.
+        # publish the resident device handles (Phase 6 deliverable 2 / the Phase-7
+        # hot-path seam). These are exactly the arrays the host return is .numpy()'d
+        # from: indptr int64 (n1+1), indices int32 (n_contacts), data int32
+        # (n_contacts, sliced off the 2x radix double-buffer).
         self.neighbor_csr_indptr_dev = self._csr_indptr_dev
         self.neighbor_csr_indices_dev = self._csr_indices[:n_contacts]
         self.neighbor_csr_data_dev = self._csr_data[:n_contacts]
         self.neighbor_csr_n_contacts = n_contacts
+        if not host_return:
+            # Phase 7: device link steppables read the handles above directly; never
+            # copy the O(#contacts) contact graph back to the host on the hot path.
+            return n_contacts
+        wp.synchronize()
+        indices = self._csr_indices.numpy().astype(np.int64)               # Medium 0 included
+        data = self._csr_data[:n_contacts].numpy().astype(np.int64)        # slice off the 2x buffer
         return indptr, indices, data
 
     # ------------------------------------------------------ tracker maintenance
