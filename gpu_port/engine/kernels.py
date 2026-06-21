@@ -1192,7 +1192,7 @@ def fpp_fill_csr_kernel(
 @wp.kernel
 def fpp_count_active_links_batched_kernel(
     R: wp.int32, M: wp.int32, n1: wp.int32,
-    pair_a: wp.array(dtype=wp.int32),              # (M,) shared topology
+    pair_a: wp.array(dtype=wp.int32),              # (R*M,) per-replica topology, -1 tombstone
     pair_b: wp.array(dtype=wp.int32),
     pair_max: wp.array(dtype=wp.float32),          # (R*M,) per-replica max length
     xsum: wp.array(dtype=wp.int64),                # (R*n1,)
@@ -1204,12 +1204,11 @@ def fpp_count_active_links_batched_kernel(
 ):
     gid = wp.tid()
     r = gid / M
-    i = gid % M
     if r >= R:
         return
-    a = pair_a[i]
-    b = pair_b[i]
-    if a < 0 or b < 0:                 # tombstoned slot (shared topology)
+    a = pair_a[gid]
+    b = pair_b[gid]
+    if a < 0 or b < 0:                 # tombstoned / unused slot
         keep_flag[gid] = 0
         return
     cell_base = r * n1
@@ -1240,7 +1239,7 @@ def fpp_count_active_links_batched_kernel(
 @wp.kernel
 def fpp_fill_csr_batched_kernel(
     R: wp.int32, M: wp.int32, n1: wp.int32, pay_stride: wp.int32,
-    pair_a: wp.array(dtype=wp.int32),              # (M,) shared topology
+    pair_a: wp.array(dtype=wp.int32),              # (R*M,) per-replica topology
     pair_b: wp.array(dtype=wp.int32),
     pair_lambda: wp.array(dtype=wp.float32),       # (R*M,)
     pair_target: wp.array(dtype=wp.float32),       # (R*M,)
@@ -1256,13 +1255,12 @@ def fpp_fill_csr_batched_kernel(
     ``r*pay_stride + link_ptr[ptr_base+cell] + cursor``."""
     gid = wp.tid()
     r = gid / M
-    i = gid % M
     if r >= R:
         return
     if keep_flag[gid] == 0:
         return
-    a = pair_a[i]
-    b = pair_b[i]
+    a = pair_a[gid]
+    b = pair_b[gid]
     lam = pair_lambda[gid]
     tgt = pair_target[gid]
     ptr_base = r * (n1 + 1)

@@ -51,9 +51,10 @@ class BatchedFPPLinks:
         self.lambda_default = float(lambda_default)
         self.max_default = float(max_length_default)
 
-        # shared topology (M,) + per-replica params (R,M)
-        self._a = np.zeros(0, dtype=np.int32)
-        self._b = np.zeros(0, dtype=np.int32)
+        # PER-REPLICA topology + params, all (R, M) with -1 tombstones in _a/_b for
+        # unused / deleted slots. A shared topology (Tier 1) is just every row equal.
+        self._a = np.full((self.R, 0), -1, dtype=np.int32)
+        self._b = np.full((self.R, 0), -1, dtype=np.int32)
         self._lam = np.zeros((self.R, 0), dtype=np.float32)
         self._tgt = np.zeros((self.R, 0), dtype=np.float32)
         self._max = np.zeros((self.R, 0), dtype=np.float32)
@@ -87,32 +88,63 @@ class BatchedFPPLinks:
         raise ValueError(f"per-link param shape {v.shape} != scalar / (M={m},) / (R={self.R}, M={m})")
 
     def set_topology(self, pairs, lambdas=None, targets=None, maxlens=None):
-        """Replace the SHARED undirected topology. ``pairs`` is (M,2) int cell ids.
-        Each per-link param may be a scalar / (M,) shared / (R,M) per-replica array
-        (or None -> the class default)."""
+        """Replace the topology with a SHARED undirected network (Tier 1 sweep case):
+        every replica gets the same ``pairs`` (M,2), broadcast to (R, M). Each per-link
+        param may be a scalar / (M,) shared / (R,M) per-replica array (or None ->
+        default)."""
         pairs = np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
         m = pairs.shape[0]
-        self._a = pairs[:, 0].astype(np.int32).copy()
-        self._b = pairs[:, 1].astype(np.int32).copy()
+        self._a = np.broadcast_to(pairs[:, 0], (self.R, m)).astype(np.int32).copy()
+        self._b = np.broadcast_to(pairs[:, 1], (self.R, m)).astype(np.int32).copy()
         self._lam = self._broadcast(lambdas, self.lambda_default, m)
         self._tgt = self._broadcast(targets, self.target_default, m)
         self._max = self._broadcast(maxlens, self.max_default, m)
         self._dev_dirty = True
 
+    def set_per_replica_pairs(self, pairs_list, lambdas=None, targets=None, maxlens=None):
+        """Replace the topology with a DIFFERENT undirected network per replica (Tier 2
+        dynamic case). ``pairs_list`` is a length-R list of (m_r, 2) int arrays; rows
+        are padded to ``M = max(m_r)`` with -1 tombstones. ``lambdas`` / ``targets`` /
+        ``maxlens`` are matching length-R lists of (m_r,) arrays (or None -> default)."""
+        R = self.R
+        assert len(pairs_list) == R, f"pairs_list len {len(pairs_list)} != R {R}"
+        ps = [np.asarray(p, dtype=np.int32).reshape(-1, 2) for p in pairs_list]
+        M = max((p.shape[0] for p in ps), default=0)
+        a = np.full((R, M), -1, dtype=np.int32)
+        b = np.full((R, M), -1, dtype=np.int32)
+        lam = np.full((R, M), self.lambda_default, dtype=np.float32)
+        tgt = np.full((R, M), self.target_default, dtype=np.float32)
+        mx = np.full((R, M), self.max_default, dtype=np.float32)
+        for r in range(R):
+            m = ps[r].shape[0]
+            if m == 0:
+                continue
+            a[r, :m] = ps[r][:, 0]
+            b[r, :m] = ps[r][:, 1]
+            if lambdas is not None:
+                lam[r, :m] = np.asarray(lambdas[r], dtype=np.float32).reshape(-1)
+            if targets is not None:
+                tgt[r, :m] = np.asarray(targets[r], dtype=np.float32).reshape(-1)
+            if maxlens is not None:
+                mx[r, :m] = np.asarray(maxlens[r], dtype=np.float32).reshape(-1)
+        self._a, self._b, self._lam, self._tgt, self._max = a, b, lam, tgt, mx
+        self._dev_dirty = True
+
     @property
     def n_pairs(self) -> int:
-        return int(self._a.shape[0])
+        """Padded per-replica topology width M (slots, including tombstones)."""
+        return int(self._a.shape[1])
 
     def has_links(self) -> bool:
-        return self.n_pairs > 0
+        return self.n_pairs > 0 and bool((self._a >= 0).any())
 
     # --------------------------------------------------------------- device sync
     def _sync_device_topology(self):
         m = self.n_pairs
         R = self.R
-        self._pa = wp.array(self._a, dtype=wp.int32, device=self.device)
-        self._pb = wp.array(self._b, dtype=wp.int32, device=self.device)
-        # per-replica params flattened replica-major (r*M + i) to match the kernels
+        # all per-replica arrays flattened replica-major (r*M + i) to match the kernels
+        self._pa = wp.array(self._a.reshape(-1), dtype=wp.int32, device=self.device)
+        self._pb = wp.array(self._b.reshape(-1), dtype=wp.int32, device=self.device)
         self._plam = wp.array(self._lam.reshape(-1), dtype=wp.float32, device=self.device)
         self._ptgt = wp.array(self._tgt.reshape(-1), dtype=wp.float32, device=self.device)
         self._pmax = wp.array(self._max.reshape(-1), dtype=wp.float32, device=self.device)

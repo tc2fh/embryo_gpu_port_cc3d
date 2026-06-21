@@ -143,6 +143,37 @@ def test_batched_fpp_changes_trajectory_and_is_per_replica():
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="no CUDA GPU available")
+def test_batched_fpp_per_replica_topology_builds_correctly():
+    """set_per_replica_pairs: each replica carries a DIFFERENT link set (padded with
+    -1 tombstones). Each replica's CSR must match a single FPPLinks on that replica's
+    own pairs, and num_active reflects each replica's link count."""
+    cpa = 3
+    cfg = _cfg(seed=2)
+    R = 3
+    bstate = build_batched_grid_state(cfg, R, cells_per_axis=cpa)
+    beng = BatchedGPUEngine(bstate)
+    full = grid_graph_links(cpa)
+    subsets = [full[:5], full[:10], full]      # different lengths -> tombstone padding
+    bfpp = BatchedFPPLinks(beng, target_length_default=4.0, lambda_default=2.0,
+                           max_length_default=100.0)
+    bfpp.set_per_replica_pairs(subsets)
+    beng.attach_fpp(bfpp)                       # rebuild on pristine COM
+
+    badj = _adj_batched(bfpp.link_ptr.numpy(), bfpp.link_other.numpy(),
+                        beng.n1, R, bfpp.link_pay_stride)
+    for r in range(R):
+        seng = GPUEngine(build_grid_state(cfg, cpa))
+        sfpp = FPPLinks(seng, target_length_default=4.0, lambda_default=2.0,
+                        max_length_default=100.0)
+        sfpp.set_topology(subsets[r])
+        seng.attach_fpp(sfpp)
+        sadj = _adj_single(sfpp.link_ptr.numpy(), sfpp.link_other.numpy(), beng.n1)
+        assert badj[r] == sadj, f"replica {r} per-replica adjacency != single"
+    na = bfpp.num_active()
+    assert na[0] == 5 and na[1] == 10 and na[2] == full.shape[0]
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="no CUDA GPU available")
 def test_batched_fpp_disabled_when_no_topology():
     """has_links() False -> the engine runs the no-FPP path; bit-exact to a plain
     batched run (the new kernel args are a clean no-op when fpp_enabled=0)."""
