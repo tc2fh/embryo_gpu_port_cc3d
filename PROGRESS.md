@@ -38,4 +38,32 @@ Phase 1:
   Windows Store stub; only `.pixi/envs/default/python.exe` works). The SubagentStop gate and the
   no-headless billing guard now auto-fire. Gate logic was validated by a manual dry-run first.
 
-## Next: Phase 1 — GPU-FPP feasibility spike + toolchain validation
+## Phase 1 — GPU-FPP feasibility spike + toolchain validation — DONE (2026-06-20) — GO
+
+Status: complete; plan_deviation minor; escalate=false (verdict: `.phaserun/verdict_phase1.json`).
+Deterministic gate: clean (7 tests pass, in scope, no destructive ops) — run MANUALLY (see hook note
+below). Decision: **GO** — NVIDIA Warp 1.14.0 builds a GPU checkerboard CPM with Volume+Contact + a
+dynamic per-cell CSR FPP link list, statistically faithful to a NumPy CPU reference: link-length
+rel-mean diff 1.7% (KS D=0.061, p=0.78), volume 1.6%, both at/below the measured ~3-4% CPU-vs-CPU
+Monte-Carlo noise floor. Code under `gpu_port/phase1/` (model.py, cpm_cpu.py, cpm_gpu.py, tests/);
+findings in `gpu_port/phase1/PHASE1_FINDINGS.md`.
+
+Carry-forward for Phase 2 (from the handoff delta):
+- Warp is NOT in pixi.lock -> `pixi run pip install warp-lang` after any `pixi install`.
+- This Warp build has no `wp.mat`/`wp.matrix` const type -> pass constant tables as flat int32 device
+  arrays; kernels must live in real `.py` files (Warp reads source via `inspect`, no exec()).
+- 8-color checkerboard is for NeighborOrder<=3; the Embryo model is NeighborOrder=4 -> decide 27-color
+  vs the plan's sanctioned order<=3 restriction in Phase 2/3.
+- GPU float `atomic_add` COM/volume is non-bit-reproducible (thread ordering) though statistically
+  equivalent -> use int64 fixed-point or per-MCS COM recompute where reproducibility matters.
+
+## Harness note — SubagentStop auto-hook did NOT fire this session
+
+The settings.json hook fix (python3 -> `pixi run python`) was applied mid-session, but Claude Code
+loads hook config at session start, so the SubagentStop gate did not auto-run after the executor /
+summarizer (gate_result.json stayed at the earlier dry-run mtime). The orchestrator ran `gate.py`
+MANUALLY (same deterministic script) to verify each stop — clean pass. The auto-hook should fire
+normally next session (after a restart). Per the workflow hard rule (stale hook verdict = escalation),
+flagged for review.
+
+## Next: Phase 2 — GPU-native core engine (plan_docs/phase_02_gpu_core_engine.md)
