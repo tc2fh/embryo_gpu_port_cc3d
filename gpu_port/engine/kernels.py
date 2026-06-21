@@ -133,6 +133,69 @@ def fpp_delta_cell(
     return e
 
 
+@wp.func
+def fpp_delta_cell_b(
+    cid: wp.int32,
+    dvol: wp.float32,
+    dx: wp.float32, dy: wp.float32, dz: wp.float32,
+    cell_base: wp.int32,                   # r*n1   -> replica's COM/volume slice
+    ptr_base: wp.int32,                    # r*(n1+1) -> replica's link_ptr slice
+    pay_base: wp.int32,                    # r*pay_stride -> replica's CSR payload slice
+    xsum: wp.array(dtype=wp.int64),
+    ysum: wp.array(dtype=wp.int64),
+    zsum: wp.array(dtype=wp.int64),
+    volume: wp.array(dtype=wp.float32),
+    link_ptr: wp.array(dtype=wp.int32),
+    link_other: wp.array(dtype=wp.int32),
+    link_lambda: wp.array(dtype=wp.float32),
+    link_target: wp.array(dtype=wp.float32),
+) -> wp.float32:
+    """Replica-aware copy of ``fpp_delta_cell``: identical spring-energy math, but
+    every per-cell read is offset by ``cell_base`` and every CSR read by
+    ``ptr_base`` (link_ptr) / ``pay_base`` (link_other/lambda/target). With all bases
+    0 it is byte-identical to the single-replica func -> batched R=1 == single."""
+    if cid == 0:
+        return wp.float32(0.0)
+    v0 = volume[cell_base + cid]
+    if v0 <= 0.0:
+        return wp.float32(0.0)
+    v1 = v0 + dvol
+    if v1 <= 0.0:
+        return wp.float32(0.0)
+    x0 = wp.float64(xsum[cell_base + cid])
+    y0 = wp.float64(ysum[cell_base + cid])
+    z0 = wp.float64(zsum[cell_base + cid])
+    cx0 = wp.float32(x0 / wp.float64(v0))
+    cy0 = wp.float32(y0 / wp.float64(v0))
+    cz0 = wp.float32(z0 / wp.float64(v0))
+    cx1 = wp.float32((x0 + wp.float64(dx)) / wp.float64(v1))
+    cy1 = wp.float32((y0 + wp.float64(dy)) / wp.float64(v1))
+    cz1 = wp.float32((z0 + wp.float64(dz)) / wp.float64(v1))
+    e = wp.float32(0.0)
+    start = link_ptr[ptr_base + cid]
+    end = link_ptr[ptr_base + cid + 1]
+    for k in range(start, end):
+        other = link_other[pay_base + k]
+        vo = volume[cell_base + other]
+        if vo <= 0.0:
+            continue
+        ox = wp.float32(wp.float64(xsum[cell_base + other]) / wp.float64(vo))
+        oy = wp.float32(wp.float64(ysum[cell_base + other]) / wp.float64(vo))
+        oz = wp.float32(wp.float64(zsum[cell_base + other]) / wp.float64(vo))
+        lam = link_lambda[pay_base + k]
+        tgt = link_target[pay_base + k]
+        b0 = cx0 - ox
+        b1 = cy0 - oy
+        b2 = cz0 - oz
+        lbefore = wp.sqrt(b0 * b0 + b1 * b1 + b2 * b2)
+        a0 = cx1 - ox
+        a1 = cy1 - oy
+        a2 = cz1 - oz
+        lafter = wp.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
+        e += lam * ((lafter - tgt) * (lafter - tgt) - (lbefore - tgt) * (lbefore - tgt))
+    return e
+
+
 # ---------------------------------------------------------------------------
 # Metropolis -- one checkerboard color per launch
 # ---------------------------------------------------------------------------
@@ -502,6 +565,15 @@ def metropolis_color_batched_kernel(
     mcs: wp.int32,
     base_seed_r: wp.array(dtype=wp.int32),         # (R,) per-replica base seed
     temperature: wp.array(dtype=wp.float32),       # (R,) per-replica temperature
+    # --- FocalPointPlasticity (batched). fpp_enabled==0 -> no-op (arrays may be
+    #     length-1 dummies). Per-replica link CSR: link_ptr is (R*(n1+1)) of LOCAL
+    #     per-replica offsets; link_other/lambda/target are (R*link_pay_stride). ---
+    fpp_enabled: wp.int32,
+    link_ptr: wp.array(dtype=wp.int32),
+    link_other: wp.array(dtype=wp.int32),
+    link_lambda: wp.array(dtype=wp.float32),
+    link_target: wp.array(dtype=wp.float32),
+    link_pay_stride: wp.int32,
 ):
     gid = wp.tid()
     r = gid / color_threads
@@ -582,6 +654,22 @@ def metropolis_color_batched_kernel(
             de -= contact_rt(contact, r, n_types, old_t, nt)
         if ncell != new_id:
             de += contact_rt(contact, r, n_types, new_t, nt)
+
+    # ---- FPP spring delta (replica-local link CSR), same eval point as apply ----
+    if fpp_enabled != 0:
+        fpx = wp.float32(x)
+        fpy = wp.float32(y)
+        fpz = wp.float32(z)
+        ptr_base = r * (n1 + 1)
+        pay_base = r * link_pay_stride
+        de += fpp_delta_cell_b(
+            new_id, 1.0, fpx, fpy, fpz, cell_base, ptr_base, pay_base,
+            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+        )
+        de += fpp_delta_cell_b(
+            old_id, -1.0, -fpx, -fpy, -fpz, cell_base, ptr_base, pay_base,
+            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+        )
 
     # ---- Metropolis acceptance (DefaultAcceptanceFunction) ----
     accept = False
@@ -1090,6 +1178,102 @@ def fpp_fill_csr_kernel(
     link_target[slot_a] = tgt
     pb = wp.atomic_add(cursor, b, 1)
     slot_b = link_ptr[b] + pb
+    link_other[slot_b] = a
+    link_lambda[slot_b] = lam
+    link_target[slot_b] = tgt
+
+
+# ---------------------------------------------------------------------------
+# Batched FPP link CSR (Tier 1): per-replica build over R replicas that SHARE the
+# undirected topology (pair_a/pair_b are (M,)) but carry per-replica lambda/target/
+# max ((R*M,)) and read each replica's own COM slice. keep_flag/degree/cursor and
+# the CSR payload all carry a leading replica axis. One thread per (replica, link).
+# ---------------------------------------------------------------------------
+@wp.kernel
+def fpp_count_active_links_batched_kernel(
+    R: wp.int32, M: wp.int32, n1: wp.int32,
+    pair_a: wp.array(dtype=wp.int32),              # (M,) shared topology
+    pair_b: wp.array(dtype=wp.int32),
+    pair_max: wp.array(dtype=wp.float32),          # (R*M,) per-replica max length
+    xsum: wp.array(dtype=wp.int64),                # (R*n1,)
+    ysum: wp.array(dtype=wp.int64),
+    zsum: wp.array(dtype=wp.int64),
+    volume: wp.array(dtype=wp.float32),
+    keep_flag: wp.array(dtype=wp.int32),           # (R*M,)
+    degree: wp.array(dtype=wp.int32),              # (R*(n1+1),)
+):
+    gid = wp.tid()
+    r = gid / M
+    i = gid % M
+    if r >= R:
+        return
+    a = pair_a[i]
+    b = pair_b[i]
+    if a < 0 or b < 0:                 # tombstoned slot (shared topology)
+        keep_flag[gid] = 0
+        return
+    cell_base = r * n1
+    va = volume[cell_base + a]
+    vb = volume[cell_base + b]
+    if va <= 0.0 or vb <= 0.0:
+        keep_flag[gid] = 0
+        return
+    ax = wp.float64(xsum[cell_base + a]) / wp.float64(va)
+    ay = wp.float64(ysum[cell_base + a]) / wp.float64(va)
+    az = wp.float64(zsum[cell_base + a]) / wp.float64(va)
+    bx = wp.float64(xsum[cell_base + b]) / wp.float64(vb)
+    by = wp.float64(ysum[cell_base + b]) / wp.float64(vb)
+    bz = wp.float64(zsum[cell_base + b]) / wp.float64(vb)
+    dx = wp.float32(ax - bx)
+    dy = wp.float32(ay - by)
+    dz = wp.float32(az - bz)
+    d = wp.sqrt(dx * dx + dy * dy + dz * dz)
+    ptr_base = r * (n1 + 1)
+    if d <= pair_max[gid]:
+        keep_flag[gid] = 1
+        wp.atomic_add(degree, ptr_base + a, 1)
+        wp.atomic_add(degree, ptr_base + b, 1)
+    else:
+        keep_flag[gid] = 0
+
+
+@wp.kernel
+def fpp_fill_csr_batched_kernel(
+    R: wp.int32, M: wp.int32, n1: wp.int32, pay_stride: wp.int32,
+    pair_a: wp.array(dtype=wp.int32),              # (M,) shared topology
+    pair_b: wp.array(dtype=wp.int32),
+    pair_lambda: wp.array(dtype=wp.float32),       # (R*M,)
+    pair_target: wp.array(dtype=wp.float32),       # (R*M,)
+    keep_flag: wp.array(dtype=wp.int32),           # (R*M,)
+    link_ptr: wp.array(dtype=wp.int32),            # (R*(n1+1),) per-replica LOCAL offsets
+    cursor: wp.array(dtype=wp.int32),              # (R*(n1+1),) zeroed
+    link_other: wp.array(dtype=wp.int32),          # (R*pay_stride,)
+    link_lambda: wp.array(dtype=wp.float32),
+    link_target: wp.array(dtype=wp.float32),
+):
+    """Atomic-append each kept link into BOTH endpoints' CSR ranges within its
+    replica's slice. link_ptr holds per-replica LOCAL offsets; the flat slot is
+    ``r*pay_stride + link_ptr[ptr_base+cell] + cursor``."""
+    gid = wp.tid()
+    r = gid / M
+    i = gid % M
+    if r >= R:
+        return
+    if keep_flag[gid] == 0:
+        return
+    a = pair_a[i]
+    b = pair_b[i]
+    lam = pair_lambda[gid]
+    tgt = pair_target[gid]
+    ptr_base = r * (n1 + 1)
+    pay_base = r * pay_stride
+    pa = wp.atomic_add(cursor, ptr_base + a, 1)
+    slot_a = pay_base + link_ptr[ptr_base + a] + pa
+    link_other[slot_a] = b
+    link_lambda[slot_a] = lam
+    link_target[slot_a] = tgt
+    pb = wp.atomic_add(cursor, ptr_base + b, 1)
+    slot_b = pay_base + link_ptr[ptr_base + b] + pb
     link_other[slot_b] = a
     link_lambda[slot_b] = lam
     link_target[slot_b] = tgt

@@ -199,6 +199,21 @@ class BatchedGPUEngine:
         # threads per color per replica (same upper bound as the single engine)
         self._color_threads = ((self.Lx + 1) // 2) * ((self.Ly + 1) // 2) * ((self.Lz + 1) // 2)
 
+        # FocalPointPlasticity (Tier 1). Attached via attach_fpp(); until then the
+        # batched Metropolis kernel gets length-1 dummies and fpp_enabled=0.
+        self.fpp = None
+        self._fpp_dummy_i32 = wp.zeros(1, dtype=wp.int32, device=device)
+        self._fpp_dummy_f32 = wp.zeros(1, dtype=wp.float32, device=device)
+
+    def attach_fpp(self, fpp):
+        """Attach a ``BatchedFPPLinks``: its per-replica link CSR is rebuilt once per
+        MCS (the steppable boundary) and read race-free by all 8 color kernels. With
+        R=1 and matching params this reproduces a single ``GPUEngine`` + ``FPPLinks``
+        run bit-exactly."""
+        self.fpp = fpp
+        fpp.rebuild()
+        return fpp
+
     # ------------------------------------------------------------ config plumbing
     def _resolve_configs(self, per_replica_config):
         if per_replica_config is None:
@@ -251,7 +266,27 @@ class BatchedGPUEngine:
 
     # ------------------------------------------------------------------ sweep
     def step_mcs(self, mcs: int):
-        """One Monte Carlo step for ALL replicas: 8 color launches over R*voxels."""
+        """One Monte Carlo step for ALL replicas: 8 color launches over R*voxels.
+
+        FPP links are STATIC within a sweep: if a ``BatchedFPPLinks`` is attached, its
+        per-replica CSR is rebuilt ONCE here (the per-MCS boundary), then read
+        race-free by all 8 color kernels (same contract as the single engine)."""
+        if self.fpp is not None and self.fpp.has_links():
+            self.fpp.rebuild()
+            fpp_enabled = 1
+            link_ptr = self.fpp.link_ptr
+            link_other = self.fpp.link_other
+            link_lambda = self.fpp.link_lambda
+            link_target = self.fpp.link_target
+            pay_stride = self.fpp.link_pay_stride
+        else:
+            fpp_enabled = 0
+            link_ptr = self._fpp_dummy_i32
+            link_other = self._fpp_dummy_i32
+            link_lambda = self._fpp_dummy_f32
+            link_target = self._fpp_dummy_f32
+            pay_stride = 1
+
         dim = self.R * self._color_threads
         for color in self.colors:
             wp.launch(
@@ -269,6 +304,8 @@ class BatchedGPUEngine:
                     self.nvox, self.n1, self.R,
                     self._color_threads,
                     color, mcs, self.base_seed_r, self.temperature,
+                    fpp_enabled, link_ptr, link_other, link_lambda, link_target,
+                    pay_stride,
                 ],
                 device=self.device,
             )

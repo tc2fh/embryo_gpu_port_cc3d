@@ -32,6 +32,7 @@ from .batched import (
 )
 from .cpu_reference import CPUReference
 from .fpp import FPPLinks, grid_graph_links
+from .batched_fpp import BatchedFPPLinks
 from .graph import GraphRunner, BatchedGraphRunner
 from . import geometry
 from . import steppables
@@ -59,6 +60,7 @@ __all__ = [
     "run_batched",
     "CPUReference",
     "FPPLinks",
+    "BatchedFPPLinks",
     "grid_graph_links",
     "GraphRunner",
     "BatchedGraphRunner",
