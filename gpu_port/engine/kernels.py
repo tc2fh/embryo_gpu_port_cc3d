@@ -1167,33 +1167,35 @@ def neighbor_csr_count_kernel(
 
 
 @wp.kernel
-def neighbor_csr_scatter_kernel(
+def neighbor_csr_compact_kernel(
     ht_key: wp.array(dtype=wp.int64),
     ht_count: wp.array(dtype=wp.int32),
     cap: wp.int32,
-    n_cells_p1: wp.int64,
-    indptr: wp.array(dtype=wp.int32),      # prefix sum of row_counts (n1+1)
-    cursor: wp.array(dtype=wp.int32),      # per-row append cursor (n1), zeroed
-    indices: wp.array(dtype=wp.int32),     # CSR dst ids (n_contacts)
-    data: wp.array(dtype=wp.int32),        # CSR contact counts (n_contacts)
+    cursor: wp.array(dtype=wp.int32),      # ONE global append counter (len>=1), zeroed
+    out_keys: wp.array(dtype=wp.int64),    # packed key src*n1+dst (n_contacts)
+    out_data: wp.array(dtype=wp.int32),    # contact counts (n_contacts)
 ):
-    """One thread per hash slot: atomic-append each occupied (src,dst,count) into
-    src's CSR range [indptr[src], indptr[src+1])."""
+    """One thread per hash slot: stream each occupied (packed-key, count) into dense
+    arrays via a single global append cursor. Output order is arbitrary; a following
+    GLOBAL radix sort on the packed key (src*n1+dst) restores both src-major grouping
+    and dst-ascending within-row order in one pass -- far cheaper than a segmented
+    sort over n1 tiny, highly skewed segments (the Medium row holds ~every surface
+    cell while most rows hold a handful)."""
     i = wp.tid()
     if i >= cap:
         return
     key = ht_key[i]
     if key < wp.int64(0):
         return
-    src = wp.int32(key / n_cells_p1)
-    dst = wp.int32(key % n_cells_p1)
-    pos = indptr[src] + wp.atomic_add(cursor, src, 1)
-    indices[pos] = dst
-    data[pos] = ht_count[i]
+    pos = wp.atomic_add(cursor, 0, 1)
+    out_keys[pos] = key
+    out_data[pos] = ht_count[i]
 
 
-# Within-row ascending sort is done with wp.utils.segmented_sort_pairs over the
-# CSR rows (see GPUEngine._compact_csr_device) -- O(#contacts) and robust to the
-# highly skewed row sizes (the Medium contact row holds ~every surface cell). A
-# per-row comparison-sort kernel was tried and removed: it is O(k^2) per row and
-# that one giant row serialized onto a single thread dominated the whole build.
+# Within-row ascending order is obtained by a single GLOBAL wp.utils.radix_sort_pairs
+# on the int64 packed key src*n1+dst (see GPUEngine._compact_csr_device): ascending
+# key == ascending (src, dst) since dst < n1, so one O(#contacts) sort yields the CSR
+# layout directly. This replaced an earlier segmented_sort_pairs over the CSR rows,
+# which CUB serviced poorly given ~n1 tiny, highly skewed segments (~7 ms -> <1 ms).
+# A per-row comparison-sort kernel was tried first and removed: O(k^2) per row, and
+# the one giant Medium row serialized onto a single thread dominated the whole build.

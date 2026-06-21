@@ -25,7 +25,7 @@ from __future__ import annotations
 import numpy as np
 
 import warp as wp
-import warp.utils  # segmented_sort_pairs (on-device per-row CSR sort)
+import warp.utils  # radix_sort_pairs (global int64 sort for the on-device CSR build)
 
 from .config import EngineConfig, neighbor_offsets
 from .state import EngineState
@@ -100,8 +100,8 @@ class GPUEngine:
         # on-device CSR compaction scratch (allocated lazily; grown on demand)
         self._csr_row_counts = None   # per-source degree (n1+1 int32)
         self._csr_cursor = None       # per-row append cursor (n1+1 int32)
-        self._csr_indices = None      # compact CSR dst ids (>= n_contacts int32)
-        self._csr_data = None         # compact CSR counts  (>= n_contacts int32)
+        self._csr_keys = None         # dense packed keys src*n1+dst (>= 2*n_contacts int64)
+        self._csr_data = None         # dense CSR counts  (>= 2*n_contacts int32)
 
     # ---------------------------------------------------------------- FPP attach
     def attach_fpp(self, fpp):
@@ -302,10 +302,13 @@ class GPUEngine:
         return indptr, dst.astype(np.int64), data.astype(np.int64)
 
     def _compact_csr_device(self, cap: int, n1: int):
-        """On-device compaction of the hash table: count -> host cumsum of the tiny
-        per-row degree -> atomic-cursor scatter -> per-row ascending sort. Transfers
-        only the per-row counts (n1 ints) + the compact O(#contacts) CSR. Output is
-        byte-identical to ``_compact_csr_host`` (same ascending-within-row order)."""
+        """On-device compaction of the hash table: count per-source degree -> host
+        cumsum -> stream occupied (packed-key, count) into dense arrays -> ONE global
+        radix sort on the int64 packed key src*n1+dst. Ascending key == ascending
+        (src, dst) (dst < n1), so the single sort yields the CSR layout directly --
+        no segmented sort over n1 tiny skewed rows. Transfers only the per-row counts
+        (n1 ints) + the compact O(#contacts) result. Byte-identical to
+        ``_compact_csr_host`` (same ascending-within-row order)."""
         # scratch (lazy; row_counts/cursor sized n1+1 like the FPP build)
         if self._csr_row_counts is None or self._csr_row_counts.shape[0] < n1 + 1:
             self._csr_row_counts = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
@@ -329,34 +332,28 @@ class GPUEngine:
         if n_contacts == 0:
             return indptr, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
 
-        indptr_dev = wp.array(indptr.astype(np.int32), dtype=wp.int32, device=self.device)
-
-        # compact output buffers (cached, grown on demand). segmented_sort_pairs
-        # double-buffers, so its key/value storage must hold 2*count elements.
+        # dense sort buffers (cached, grown on demand). radix_sort_pairs double-
+        # buffers, so key/value storage must hold 2*count elements.
         need = 2 * n_contacts
-        if self._csr_indices is None or self._csr_indices.shape[0] < need:
-            self._csr_indices = wp.zeros(need, dtype=wp.int32, device=self.device)
+        if self._csr_keys is None or self._csr_keys.shape[0] < need:
+            self._csr_keys = wp.zeros(need, dtype=wp.int64, device=self.device)
             self._csr_data = wp.zeros(need, dtype=wp.int32, device=self.device)
-        self._csr_cursor.zero_()
+        self._csr_cursor.zero_()  # slot 0 is the single global append counter
 
         wp.launch(
-            K.neighbor_csr_scatter_kernel,
+            K.neighbor_csr_compact_kernel,
             dim=cap,
-            inputs=[self._ht_key, self._ht_count, cap, wp.int64(n1),
-                    indptr_dev, self._csr_cursor, self._csr_indices, self._csr_data],
+            inputs=[self._ht_key, self._ht_count, cap,
+                    self._csr_cursor, self._csr_keys, self._csr_data],
             device=self.device,
         )
-        # sort dst ascending WITHIN each source row (co-moving the counts) with a
-        # segmented radix sort. Segments are the CSR rows: segment i spans
-        # [indptr[i], indptr[i+1]) (ends inferred from indptr_dev[1:]). This is
-        # O(#contacts) and handles the highly skewed row sizes -- the Medium row
-        # holds ~every surface cell, which a per-row O(k^2) comparison sort chokes
-        # on (one giant row dominates a single thread).
-        wp.utils.segmented_sort_pairs(self._csr_indices, self._csr_data,
-                                      n_contacts, indptr_dev)
+        # one global radix sort of the int64 packed key (co-moving the counts): groups
+        # by src and orders dst ascending within each row in a single O(#contacts) pass.
+        wp.utils.radix_sort_pairs(self._csr_keys, self._csr_data, n_contacts)
         wp.synchronize()
 
-        indices = self._csr_indices.numpy()[:n_contacts].astype(np.int64)
+        keys = self._csr_keys.numpy()[:n_contacts]
+        indices = (keys % np.int64(n1)).astype(np.int64)   # dst id (Medium 0 included)
         data = self._csr_data.numpy()[:n_contacts].astype(np.int64)
         return indptr, indices, data
 
