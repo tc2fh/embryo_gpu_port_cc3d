@@ -33,6 +33,31 @@ from .steppables import (
 )
 
 
+class _ReplicaEngineView:
+    """Read-only single-engine facade over ``BatchedGPUEngine`` replica ``r``.
+
+    Exposes exactly the surface the single-replica ``CohesotaxisPipeline`` reads:
+    per-replica DEVICE SLICES of ids / xsum / ysum / zsum / volume (which alias the
+    batched arrays, so they reflect the live sweep state), the shared cell_type, the
+    lattice dims + cfg, and the replica's base seed. Lets the validated single
+    cohesotaxis pipeline run per replica without porting its kernels to the batch axis.
+    """
+
+    def __init__(self, engine, r: int):
+        n1, nvox = engine.n1, engine.nvox
+        self.device = engine.device
+        self.cell_type = engine.cell_type          # shared across replicas
+        self.n_cells = engine.n_cells
+        self.Lx, self.Ly, self.Lz = engine.Lx, engine.Ly, engine.Lz
+        self.cfg = engine.cfg
+        self.ids = engine.ids[r * nvox:(r + 1) * nvox]
+        self.xsum = engine.xsum[r * n1:(r + 1) * n1]
+        self.ysum = engine.ysum[r * n1:(r + 1) * n1]
+        self.zsum = engine.zsum[r * n1:(r + 1) * n1]
+        self.volume = engine.volume[r * n1:(r + 1) * n1]
+        self.base_seed = int(engine._seeds_np[r])
+
+
 class BatchedTissueLinkSteppable:
     """Batched TISSUE-link + intercalation dynamics over R replicas.
 
@@ -253,21 +278,110 @@ class BatchedPassiveSubstrateSteppable:
         return [int(np.count_nonzero(self._sl[r][self.passive])) for r in range(self.R)]
 
 
+class BatchedLamellipodiaSteppable:
+    """Batched port of ``LamellipodiaSteppable`` (the ifCohesotaxis leading-edge
+    dynamics). Reuses the VALIDATED single ``CohesotaxisPipeline`` per replica via a
+    ``_ReplicaEngineView`` (Tier 2e): per MCS, for each LEADING cell, Poisson-delete
+    its lamellipodia link (per-replica LamellaeRate) then, if it now has none, run the
+    cohesotaxis pipeline to pick a substrate target and (re)create the link.
+
+    ``self.link_target[r]`` mirrors CC3D ``cell.dict['link']`` (substrate id a leader
+    is linked to; 0 = none) per replica. The pipelines are built once over live device
+    slices, so the gumbel/manhattan kernels read each replica's current lattice."""
+
+    def __init__(self, engine: BatchedGPUEngine, links: BatchedFPPLinks,
+                 leading_type: int = 1, substrate_type: int = 4, passive_type: int = 2,
+                 params: EmbryoParams = DEFAULT, delete_rate=None, owns_topology: bool = True):
+        from engine import cohesotaxis as CT
+        self._CT = CT
+        self.engine = engine
+        self.links = links
+        self.p = params
+        self.R = engine.R
+        self.n1 = engine.n1
+        self.owns_topology = bool(owns_topology)
+        ld = params.lamellipodia_distance
+        self.views = [_ReplicaEngineView(engine, r) for r in range(self.R)]
+        self.pipes = [CT.CohesotaxisPipeline(
+            self.views[r], leading_type=leading_type, substrate_type=substrate_type,
+            passive_type=passive_type, lamellipodia_distance=ld, sigma=params.sigma)
+            for r in range(self.R)]
+        self.lead_ids = self.pipes[0].lead_ids            # same across replicas (shared types)
+        self.link_target = np.zeros((self.R, self.n1), dtype=np.int32)
+        self._seeds = np.asarray(engine._seeds_np, dtype=np.int64)
+        if delete_rate is None:
+            delete_rate = np.full(self.R, params.lamellae_rate, dtype=np.float64)
+        self.delete_rate = np.broadcast_to(np.asarray(delete_rate, dtype=np.float64),
+                                           (self.R,)).copy()
+
+    def emit(self, r):
+        lt = self.link_target[r]
+        cells = [int(c) for c in self.lead_ids if lt[int(c)] != 0]
+        pairs = np.array([(c, int(lt[c])) for c in cells], dtype=np.int32).reshape(-1, 2)
+        n = pairs.shape[0]
+        lam = np.full(n, self._CT.LAMELLIPODIA_LAMBDA, dtype=np.float32)
+        tgt = np.full(n, self._CT.LL_TARGET_DIST, dtype=np.float32)
+        mx = np.full(n, self._CT.LL_MAX_DIST, dtype=np.float32)
+        return pairs, lam, tgt, mx
+
+    def _push_topology(self):
+        pairs, lam, tgt, mx = [], [], [], []
+        for r in range(self.R):
+            p, l, t, m = self.emit(r)
+            pairs.append(p); lam.append(l); tgt.append(t); mx.append(m)
+        self.links.set_per_replica_pairs(pairs, lambdas=lam, targets=tgt, maxlens=mx)
+
+    def start(self):
+        for r in range(self.R):
+            targets = self.pipes[r].select_targets(mcs=0)
+            lt = self.link_target[r]
+            for cell, tgt in targets.items():
+                lt[cell] = tgt
+        if self.owns_topology:
+            self._push_topology()
+        return [int(np.count_nonzero(self.link_target[r][self.lead_ids])) for r in range(self.R)]
+
+    def step(self, mcs: int):
+        CT = self._CT
+        dev = self.engine.device
+        for r in range(self.R):
+            lt = self.link_target[r]
+            # (1) Poisson-delete existing lamellipodia links (on-device decisions)
+            dec = CT.poisson_delete_decisions(self.n1, mcs, int(self._seeds[r]),
+                                              float(self.delete_rate[r]), dev)
+            for cell in self.lead_ids:
+                cell = int(cell)
+                if lt[cell] != 0 and dec[cell] == 1:
+                    lt[cell] = 0
+            # (2) recreate lamellipodia links for leaders now lacking one
+            need = {int(c) for c in self.lead_ids if lt[int(c)] == 0}
+            if need:
+                targets = self.pipes[r].select_targets(mcs)
+                for cell, tgt in targets.items():
+                    if cell in need:
+                        lt[cell] = tgt
+        if self.owns_topology:
+            self._push_topology()
+        return [int(np.count_nonzero(self.link_target[r][self.lead_ids])) for r in range(self.R)]
+
+
 class BatchedEmbryoModel:
     """End-to-end batched Embryo driver (Tier 2): R replicas advanced together with
     batched CPM + FPP energy, while the host-orchestrated link dynamics (tissue
     intercalation + passive-substrate adhesion) run per replica and jointly own ONE
     batched FPP inventory.
 
-    ``enable`` selects link dynamics. ``tissue_delete_prob`` / ``sub_delete_prob`` are
-    optional length-R sweep axes (TissueRate / SubLinkRate). NOTE: cohesotaxis /
-    lamellipodia (the ifCohesotaxis variant) is NOT yet batched -- see Tier 2e.
+    ``enable`` selects link dynamics (default: all -- tissue + lamellipodia +
+    passive_substrate). ``tissue_delete_prob`` / ``sub_delete_prob`` /
+    ``lamellae_delete_rate`` are optional length-R sweep axes (TissueRate / SubLinkRate
+    / LamellaeRate). Lamellipodia (cohesotaxis) runs the validated single pipeline per
+    replica via ``_ReplicaEngineView``.
     """
 
     def __init__(self, engine: BatchedGPUEngine, params: EmbryoParams = DEFAULT,
-                 enable=("tissue", "passive_substrate"),
+                 enable=("tissue", "lamellipodia", "passive_substrate"),
                  leading_type: int = 1, passive_type: int = 2, substrate_type: int = 4,
-                 tissue_delete_prob=None, sub_delete_prob=None):
+                 tissue_delete_prob=None, sub_delete_prob=None, lamellae_delete_rate=None):
         self.engine = engine
         self.p = params
         self.enable = set(enable)
@@ -276,6 +390,11 @@ class BatchedEmbryoModel:
             engine, target_length_default=params.tissue_target,
             lambda_default=params.tissue_lambda, max_length_default=params.tissue_max)
         self.steppables = []
+        if "lamellipodia" in self.enable:
+            self.steppables.append(BatchedLamellipodiaSteppable(
+                engine, self.links, leading_type=leading_type, substrate_type=substrate_type,
+                passive_type=passive_type, params=params, delete_rate=lamellae_delete_rate,
+                owns_topology=False))
         if "tissue" in self.enable:
             self.steppables.append(BatchedTissueLinkSteppable(
                 engine, self.links, cell_types=(leading_type,), params=params,
