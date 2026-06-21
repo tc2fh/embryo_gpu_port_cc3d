@@ -384,3 +384,30 @@ add the COM-snapshot/double-buffer fix (snapshot COM per color sweep before FPP 
 for lattices >1290^3 (not needed by any current target); (3) **batched FPP / end-to-end batched `EmbryoModel`** for
 FPP-parameter sweeps (needs a per-replica link CSR + `embryo/` edits; was out of Phase 4 scope); (4) the **long-horizon
 offline CC3D ensemble** (`CC3D_OFFLINE=1` test) carried from Phase 3 is still un-run.
+
+---
+
+## Phase 5 (ad-hoc, no spec) — batched FPP for parameter sweeps — DONE (2026-06-21)
+
+Open item (3) above was delivered ad-hoc in commits `5b12948`→`aba4c54` (Tier 2a–2e): per-replica neighbor-contact
+CSR, per-replica dynamic link topology, batched intercalation/substrate/cohesotaxis (per-replica engine view), and a
+combined `BatchedEmbryoModel` — the FULL Embryo is now sweepable across replicas. 100 tests green / 3 skip. **No
+`plan_docs/phase_05_*.md` was written** (hence the numbering gap); state lives in git + auto-memory.
+
+## Planning note — host→device optimization defined (Phases 6–8) — 2026-06-21 (NOT yet executed)
+
+Orchestrated a read-only profiling/definition pass (3 subagents over engine / steppables / batched paths) for the
+request "define what in `gpu_port` runs on CPU that could move to GPU." Finding: the GPU Metropolis sweep is already
+cheap (~0.9 ms/MCS); the per-MCS cost is **host-side** — neighbor-CSR copyback (`csr_ms` ~2.3 ms) + Python steppable
+link-management loops (`steppable_ms` ~4.9 ms), and the batched path is O(R) host loops. Root cause: the contact CSR
+is built on GPU but returned to host NumPy, and the FPP link inventory is host-resident, so all link logic runs in
+Python. Wrote the definition + a 3-phase, dependency-ordered, fidelity-constrained plan:
+- `plan_docs/CC3D-GPU-host-to-device-plan.md` — overview + consolidated 16-candidate inventory + fidelity invariants.
+- `plan_docs/phase_06_device_csr_link_topology.md` — device scans + CSR residency + device-authoritative link
+  topology (engine only; fidelity-neutral foundation; low risk).
+- `plan_docs/phase_07_device_link_steppables.md` — port tissue/substrate/Poisson link loops to device kernels; drop
+  the CSR copyback (engine+embryo; med risk: tissue cap-order fidelity).
+- `plan_docs/phase_08_cohesotaxis_fusion_batched_collapse.md` — fuse cohesotaxis + collapse the batched R-loops
+  (engine+embryo; high risk: Gumbel/Manhattan exactness + bit-exact-per-replica; biggest sweep-throughput win).
+Scope sections verified parseable by `gate.py::declared_scope`. Docs are uncommitted in the working tree. Awaiting
+"start the phase run" to execute `phase_06`→`07`→`08` per `.claude/workflow.md`.
