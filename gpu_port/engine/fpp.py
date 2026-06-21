@@ -222,9 +222,17 @@ class FPPLinks:
 
     # --------------------------------------------------------------- observables
     def active_link_lengths(self) -> np.ndarray:
-        """COM-to-COM length of each currently-kept link (host copy)."""
+        """COM-to-COM length of each currently-kept link (host copy).
+
+        Ensures the device keep-flags reflect the CURRENT topology: if the host
+        topology was edited (create/delete) since the last rebuild -- e.g. a
+        steppable mutated links after the per-MCS ``step_mcs`` rebuild -- ``_keep``
+        would be stale (a different length than ``self._a``); rebuild first so the
+        kept set + lengths are consistent with the live topology and COMs."""
         if self.n_pairs == 0:
             return np.zeros(0)
+        if self._dev_dirty or self._keep is None or self._keep.shape[0] < self.n_pairs:
+            self.rebuild()
         coms = np.zeros((self.n1, 3))
         coms[1:] = self.engine.coms()
         keep = self._keep.numpy().astype(bool)[: self.n_pairs]

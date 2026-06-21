@@ -72,6 +72,50 @@ class CPUReference:
         self._fpp_max = np.broadcast_to(np.asarray(maxlen, np.float64), (m,)).copy()
         self._rebuild_fpp_links()
 
+    def create_fpp_link(self, a, b, lam, target, maxlen):
+        """Append an undirected link a-b with per-link params (mirrors the GPU
+        ``FPPLinks.create_link`` topology edit at the steppable boundary). Effective
+        at the next ``_rebuild_fpp_links`` (run once per MCS in ``step_mcs``)."""
+        if self._fpp_pairs is None:
+            self._fpp_pairs = np.zeros((0, 2), dtype=np.int64)
+            self._fpp_lambda = np.zeros(0, dtype=np.float64)
+            self._fpp_target = np.zeros(0, dtype=np.float64)
+            self._fpp_max = np.zeros(0, dtype=np.float64)
+        self._fpp_pairs = np.vstack([self._fpp_pairs, [int(a), int(b)]]).astype(np.int64)
+        self._fpp_lambda = np.append(self._fpp_lambda, float(lam))
+        self._fpp_target = np.append(self._fpp_target, float(target))
+        self._fpp_max = np.append(self._fpp_max, float(maxlen))
+
+    def delete_fpp_link(self, a, b):
+        """Remove every undirected link matching {a,b} (mirrors the GPU
+        ``FPPLinks.delete_link``)."""
+        if self._fpp_pairs is None or self._fpp_pairs.shape[0] == 0:
+            return
+        a, b = int(a), int(b)
+        pa = self._fpp_pairs[:, 0]; pb = self._fpp_pairs[:, 1]
+        match = ((pa == a) & (pb == b)) | ((pa == b) & (pb == a))
+        if np.any(match):
+            keep = ~match
+            self._fpp_pairs = self._fpp_pairs[keep]
+            self._fpp_lambda = self._fpp_lambda[keep]
+            self._fpp_target = self._fpp_target[keep]
+            self._fpp_max = self._fpp_max[keep]
+
+    def has_link(self, a, b) -> bool:
+        if self._fpp_pairs is None or self._fpp_pairs.shape[0] == 0:
+            return False
+        a, b = int(a), int(b)
+        pa = self._fpp_pairs[:, 0]; pb = self._fpp_pairs[:, 1]
+        return bool(np.any(((pa == a) & (pb == b)) | ((pa == b) & (pb == a))))
+
+    def links_of_cell(self, c) -> np.ndarray:
+        """Indices into the link arrays touching cell ``c``."""
+        if self._fpp_pairs is None or self._fpp_pairs.shape[0] == 0:
+            return np.zeros(0, dtype=np.int64)
+        c = int(c)
+        pa = self._fpp_pairs[:, 0]; pb = self._fpp_pairs[:, 1]
+        return np.nonzero((pa == c) | (pb == c))[0]
+
     def _rebuild_fpp_links(self):
         """Recompute the active link set (COM length <= max) and per-cell
         adjacency with the kept links' params."""
