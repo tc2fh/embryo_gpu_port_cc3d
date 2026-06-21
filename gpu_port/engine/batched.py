@@ -49,6 +49,7 @@ from __future__ import annotations
 import numpy as np
 
 import warp as wp
+import warp.utils  # radix_sort_pairs (per-replica neighbor-CSR compaction)
 
 from .config import EngineConfig, neighbor_offsets
 from .state import EngineState, build_grid_state, state_from_id_lattice
@@ -205,6 +206,17 @@ class BatchedGPUEngine:
         self._fpp_dummy_i32 = wp.zeros(1, dtype=wp.int32, device=device)
         self._fpp_dummy_f32 = wp.zeros(1, dtype=wp.float32, device=device)
 
+        # batched neighbor-contact CSR scratch (Tier 2a). Per-replica hash region +
+        # the single-replica compaction scratch reused across the per-replica loop.
+        self._bht_key = None
+        self._bht_count = None
+        self._bht_cap = 0
+        self._csr_row_counts = None
+        self._csr_cursor = None
+        self._csr_keys = None
+        self._csr_data = None
+        self._csr_indices = None
+
     def attach_fpp(self, fpp):
         """Attach a ``BatchedFPPLinks``: its per-replica link CSR is rebuilt once per
         MCS (the steppable boundary) and read race-free by all 8 color kernels. With
@@ -213,6 +225,104 @@ class BatchedGPUEngine:
         self.fpp = fpp
         fpp.rebuild()
         return fpp
+
+    # ------------------------------------------------- batched neighbor-contact CSR
+    def neighbor_contact_csr(self, order: int | None = None):
+        """Per-replica common-surface-area CSR (Tier 2a). Returns a length-R list of
+        ``(indptr, indices, data)`` -- each byte-identical to the single
+        ``GPUEngine.neighbor_contact_csr`` on that replica's lattice (the building
+        block the batched Embryo steppables consume per replica).
+
+        One batched hash launch fills R independent per-replica hash regions; each
+        region is then compacted with the SAME on-device pipeline as the single
+        engine (count -> host cumsum -> compact -> global int64 radix sort ->
+        device dst-extract), looped over replicas (cheap at sweep lattice sizes)."""
+        if order is None:
+            order = self.cfg.tracker_neighbor_order
+        off = neighbor_offsets(order)
+        off_w = wp.array(off.flatten().astype(np.int32), dtype=wp.int32, device=self.device)
+        n_off = int(off.shape[0])
+        n1 = self.n1
+        nvox = self.nvox
+        R = self.R
+
+        upper = min(int(nvox) * n_off, int(n1) * int(n1))
+        cap = 1
+        target = max(1024, upper * 2)
+        while cap < target:
+            cap <<= 1
+        if self._bht_key is None or self._bht_cap != cap:
+            self._bht_key = wp.zeros(R * cap, dtype=wp.int64, device=self.device)
+            self._bht_count = wp.zeros(R * cap, dtype=wp.int32, device=self.device)
+            self._bht_cap = cap
+        self._bht_key.fill_(wp.int64(-1))
+        self._bht_count.zero_()
+
+        wp.launch(
+            K.neighbor_contact_hash_batched_kernel,
+            dim=R * nvox,
+            inputs=[
+                self.ids, self.Lx, self.Ly, self.Lz, nvox, R,
+                off_w, n_off, wp.int64(n1), cap,
+                self._bht_key, self._bht_count,
+            ],
+            device=self.device,
+        )
+        wp.synchronize()
+
+        out = []
+        for r in range(R):
+            ks = self._bht_key[r * cap:(r + 1) * cap]
+            cs = self._bht_count[r * cap:(r + 1) * cap]
+            out.append(self._compact_csr_slice(ks, cs, cap, n1))
+        return out
+
+    def _compact_csr_slice(self, ht_key, ht_count, cap: int, n1: int):
+        """Compact one replica's hash slice into (indptr, indices, data) -- the exact
+        single-engine on-device pipeline (``GPUEngine._compact_csr_device``), pointed
+        at a per-replica view. Scratch is cached + grown across the replica loop."""
+        if self._csr_row_counts is None or self._csr_row_counts.shape[0] < n1 + 1:
+            self._csr_row_counts = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
+            self._csr_cursor = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
+        self._csr_row_counts.zero_()
+        wp.launch(
+            K.neighbor_csr_count_kernel,
+            dim=cap,
+            inputs=[ht_key, cap, wp.int64(n1), self._csr_row_counts],
+            device=self.device,
+        )
+        wp.synchronize()
+        row_counts = self._csr_row_counts.numpy()[:n1]
+        indptr = np.zeros(n1 + 1, dtype=np.int64)
+        indptr[1:] = np.cumsum(row_counts)
+        n_contacts = int(indptr[-1])
+        if n_contacts == 0:
+            return indptr, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+
+        need = 2 * n_contacts
+        if self._csr_keys is None or self._csr_keys.shape[0] < need:
+            self._csr_keys = wp.zeros(need, dtype=wp.int64, device=self.device)
+            self._csr_data = wp.zeros(need, dtype=wp.int32, device=self.device)
+        self._csr_cursor.zero_()
+        wp.launch(
+            K.neighbor_csr_compact_kernel,
+            dim=cap,
+            inputs=[ht_key, ht_count, cap, self._csr_cursor, self._csr_keys, self._csr_data],
+            device=self.device,
+        )
+        wp.utils.radix_sort_pairs(self._csr_keys, self._csr_data, n_contacts)
+        if self._csr_indices is None or self._csr_indices.shape[0] < n_contacts:
+            self._csr_indices = wp.zeros(n_contacts, dtype=wp.int32, device=self.device)
+        wp.launch(
+            K.neighbor_csr_extract_dst_kernel,
+            dim=n_contacts,
+            inputs=[self._csr_keys, n_contacts, wp.int64(n1), self._csr_indices],
+            device=self.device,
+        )
+        wp.synchronize()
+        indices = self._csr_indices.numpy()[:n_contacts].astype(np.int64)
+        data = self._csr_data[:n_contacts].numpy().astype(np.int64)
+        return indptr, indices, data
 
     # ------------------------------------------------------------ config plumbing
     def _resolve_configs(self, per_replica_config):

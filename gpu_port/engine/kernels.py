@@ -1323,6 +1323,50 @@ def neighbor_contact_hash_kernel(
                     break
 
 
+@wp.kernel
+def neighbor_contact_hash_batched_kernel(
+    ids: wp.array(dtype=wp.int32),         # (R*nvox,) flat, replica-major
+    Lx: wp.int32, Ly: wp.int32, Lz: wp.int32,
+    nvox: wp.int32, R: wp.int32,
+    nbr_off: wp.array(dtype=wp.int32),
+    n_nbr: wp.int32,
+    n_cells_p1: wp.int64,
+    cap: wp.int32,
+    ht_key: wp.array(dtype=wp.int64),      # (R*cap,) per-replica hash region, -1 empty
+    ht_count: wp.array(dtype=wp.int32),    # (R*cap,)
+):
+    """Replica-aware copy of ``neighbor_contact_hash_kernel``: one thread per
+    (replica, voxel). Each replica hashes only into its own ``[r*cap, (r+1)*cap)``
+    region (probing wraps within that region), so the per-replica tables are
+    independent and a per-replica compaction reproduces the single-engine CSR."""
+    gid = wp.tid()
+    r = gid / nvox
+    i = gid % nvox
+    if r >= R:
+        return
+    vox_base = r * nvox
+    ht_base = r * cap
+    self_id = ids[vox_base + i]
+    x = i % Lx
+    rem = i / Lx
+    y = rem % Ly
+    z = rem / Ly
+    for n in range(n_nbr):
+        nnx = x + nbr_off[3 * n + 0]
+        nny = y + nbr_off[3 * n + 1]
+        nnz = z + nbr_off[3 * n + 2]
+        ncell = get_id_b(ids, vox_base, nnx, nny, nnz, Lx, Ly, Lz)
+        if ncell != self_id:
+            key = wp.int64(self_id) * n_cells_p1 + wp.int64(ncell)
+            h = wp.int32((key * wp.int64(2654435761)) & wp.int64(cap - 1))
+            for _p in range(cap):
+                slot = ht_base + ((h + _p) & (cap - 1))
+                prev = wp.atomic_cas(ht_key, slot, wp.int64(-1), key)
+                if prev == wp.int64(-1) or prev == key:
+                    wp.atomic_add(ht_count, slot, 1)
+                    break
+
+
 # ---------------------------------------------------------------------------
 # On-device neighbor-contact CSR compaction (post-Phase-4 perf): turn the hash
 # table (``neighbor_contact_hash_kernel`` output) into a compact CSR sorted
