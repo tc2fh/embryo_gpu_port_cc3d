@@ -94,4 +94,40 @@ Carry-forward for Phase 3 (full delta in `.phaserun/verdict_phase2.json`):
   — MUST move to hashed/segmented CSR before full 63k-cell Embryo runs.
 - Run the order-4 CPU-CC3D ensemble fidelity check (closure free-area, intercalation) — outstanding.
 
-## Next: Phase 3 — GPU FPP + on-device cohesotaxis + full Embryo port (plan_docs/phase_03_gpu_fpp_cohesotaxis_embryo.md)
+## Phase 3 — GPU FPP + on-device cohesotaxis + full Embryo port — IN PROGRESS (plan_docs/phase_03_gpu_fpp_cohesotaxis_embryo.md)
+
+Driven as 3 tested passes (FPP integration / cohesotaxis / full Embryo), each left `pytest -q gpu_port` green.
+
+### Pass A — FPP integration + neighbor-CSR scale fix — DONE (2026-06-20)
+
+Deterministic gate: CLEAN (gate_result.json freshly written: tests_passed=true, **30 passed** [21 prior + 9 new],
+6 files / 932 lines, in scope, no destructive ops). Implemented:
+- **FPP device link CSR** in new `gpu_port/engine/fpp.py` (`FPPLinks` + `grid_graph_links`): Phase-1 atomic-append
+  (create) / flag+compaction (delete) pattern; a link drops when live COM length > its per-link max.
+  `create_link/delete_link/set_topology` edit at the steppable boundary; `rebuild()` is the per-MCS seam;
+  `attach_fpp()` wires it to the engine.
+- **Spring energy** folded into `metropolis_color_kernel` at the EXISTING changePixel/newCell seam via a
+  `fpp_delta_cell` device func, added as trailing params + an `fpp_enabled` flag (flag 0 + dummy arrays = exact
+  no-op, so the 14 Phase-2 tests are byte-unchanged). Link length read directly from the engine int64 COM
+  (`xsum/ysum/zsum / volume`). Frozen-Medium contract preserved.
+- **Neighbor-CSR scale fix:** the dense `(n_cells+1)^2` matrix (~16 GB @ 63k) is replaced by
+  `GPUEngine.neighbor_contact_csr()` — a device open-addressing hash over packed `(src,dst)` keys (`atomic_cas`)
+  -> O(#contacts) memory -> host compaction; `recompute_trackers()` now uses it; the legacy dense kernel is kept
+  (unused) for reference. Validated EXACT vs CPU recompute and builds at 40^3 = 64000 cells.
+- **Tests** (gpu_port/phase3/tests/, 9 new): `test_fpp_links.py` (CSR/degrees/adjacency exact vs NumPy;
+  create/delete; dynamic max-length cut+restore), `test_neighbor_csr_scale.py` (exact vs CPU; 64000-cell build),
+  `test_fpp_energy.py` (GPU-vs-CPU FPP statistical equiv: link KS D=0.050 p=0.935, volume rel 0.0019).
+  `cpu_reference.py` extended with FPP (`enable_fpp` / `active_link_lengths`).
+
+Decisions / notes (neither escalates):
+- **Per-link** lambda/target/max stored in the CSR (not Phase 1's single global) — matches CC3D
+  `new_fpp_link(a,b,lambda,target,max)`; required for Embryo fidelity. Cohesotaxis (Pass B) needs exactly this
+  per-link inventory + the create/delete/rebuild seam.
+- FPP-energy **mean** link-length tol set to 0.08 (~2x the 3-4% MC noise) vs Phase 1's 0.06, because the CPU
+  random-site sweep relaxes slower than the GPU checkerboard over the short 25-MCS gate; the tight distributional
+  check is KS (D=0.050, p=0.935 << the 0.20 gate). Deterministic across re-runs. **Carry-forward to Pass C:**
+  re-confirm link-length MEAN fidelity under a longer-MCS full-Embryo ensemble, not just the short gate.
+
+Next: Pass B — ifCohesotaxis=1 pipeline (stencil classify -> segmented compaction -> all-pairs PixelDist reduction
+-> Gumbel-max weighted select -> Manhattan-shell argmax) + Poisson link turnover, as on-device kernels; reuse
+Pass A's per-link FPP inventory + the create/delete/rebuild seam.

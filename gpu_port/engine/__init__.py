@@ -24,8 +24,10 @@ from .state import (
 )
 from .engine import GPUEngine, run_gpu
 from .cpu_reference import CPUReference
+from .fpp import FPPLinks, grid_graph_links
 from . import geometry
 from . import steppables
+from . import fpp
 
 __all__ = [
     "EngineConfig",
@@ -40,6 +42,9 @@ __all__ = [
     "GPUEngine",
     "run_gpu",
     "CPUReference",
+    "FPPLinks",
+    "grid_graph_links",
     "geometry",
     "steppables",
+    "fpp",
 ]

@@ -50,6 +50,85 @@ class CPUReference:
         self.T = float(self.cfg.temperature)
         self.attempts_per_mcs = int(round(self.cfg.flip2_dim_ratio * self.Lx * self.Ly * self.Lz))
 
+        # FocalPointPlasticity (optional; enabled via enable_fpp). The link
+        # topology is persistent; the *active* set (length <= max) is recomputed
+        # per MCS, exactly mirroring the GPU FPPLinks rebuild seam.
+        self._fpp_pairs = None          # (M,2)
+        self._fpp_lambda = None         # (M,)
+        self._fpp_target = None         # (M,)
+        self._fpp_max = None            # (M,)
+        self._fpp_adj = None            # per-cell list of (other, lambda, target)
+        self._fpp_keep = None           # bool mask of currently-active links
+
+    # --------------------------------------------------------------------- FPP
+    def enable_fpp(self, pairs, lam, target, maxlen):
+        """Attach FPP spring links (per-link lambda/target/max). ``pairs`` is
+        (M,2). Energy per link = lambda*(L - target)^2, L = ||COM_a - COM_b||."""
+        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        m = pairs.shape[0]
+        self._fpp_pairs = pairs
+        self._fpp_lambda = np.broadcast_to(np.asarray(lam, np.float64), (m,)).copy()
+        self._fpp_target = np.broadcast_to(np.asarray(target, np.float64), (m,)).copy()
+        self._fpp_max = np.broadcast_to(np.asarray(maxlen, np.float64), (m,)).copy()
+        self._rebuild_fpp_links()
+
+    def _rebuild_fpp_links(self):
+        """Recompute the active link set (COM length <= max) and per-cell
+        adjacency with the kept links' params."""
+        if self._fpp_pairs is None:
+            return
+        v = np.where(self.volume > 0, self.volume, 1.0)
+        cx, cy, cz = self.xsum / v, self.ysum / v, self.zsum / v
+        a = self._fpp_pairs[:, 0]; b = self._fpp_pairs[:, 1]
+        d = np.sqrt((cx[a] - cx[b]) ** 2 + (cy[a] - cy[b]) ** 2 + (cz[a] - cz[b]) ** 2)
+        keep = d <= self._fpp_max
+        self._fpp_keep = keep
+        adj = [[] for _ in range(self.n_cells + 1)]
+        for i in np.nonzero(keep)[0]:
+            ai, bi = int(a[i]), int(b[i])
+            adj[ai].append((bi, self._fpp_lambda[i], self._fpp_target[i]))
+            adj[bi].append((ai, self._fpp_lambda[i], self._fpp_target[i]))
+        self._fpp_adj = [
+            (np.array([t[0] for t in lst], dtype=np.int64),
+             np.array([t[1] for t in lst], dtype=np.float64),
+             np.array([t[2] for t in lst], dtype=np.float64))
+            for lst in adj
+        ]
+
+    def _fpp_cell_delta(self, cid, dvol, dxs, dys, dzs) -> float:
+        """dE for shifting cell cid's COM by (dvol, dxs, dys, dzs) over its links
+        (read from the int64-equivalent xsum/ysum/zsum / volume COM)."""
+        if cid == 0 or self._fpp_adj is None:
+            return 0.0
+        others, lam, tgt = self._fpp_adj[cid]
+        if others.size == 0:
+            return 0.0
+        v0 = self.volume[cid]
+        if v0 <= 0:
+            return 0.0
+        v1 = v0 + dvol
+        if v1 <= 0:
+            return 0.0
+        cx0 = self.xsum[cid] / v0; cy0 = self.ysum[cid] / v0; cz0 = self.zsum[cid] / v0
+        cx1 = (self.xsum[cid] + dxs) / v1
+        cy1 = (self.ysum[cid] + dys) / v1
+        cz1 = (self.zsum[cid] + dzs) / v1
+        vo = np.where(self.volume[others] > 0, self.volume[others], 1.0)
+        ox = self.xsum[others] / vo; oy = self.ysum[others] / vo; oz = self.zsum[others] / vo
+        lb = np.sqrt((cx0 - ox) ** 2 + (cy0 - oy) ** 2 + (cz0 - oz) ** 2)
+        la = np.sqrt((cx1 - ox) ** 2 + (cy1 - oy) ** 2 + (cz1 - oz) ** 2)
+        return float(np.sum(lam * ((la - tgt) ** 2 - (lb - tgt) ** 2)))
+
+    def _d_fpp(self, x, y, z, new_id, old_id) -> float:
+        if self._fpp_adj is None:
+            return 0.0
+        e = 0.0
+        if new_id != 0:
+            e += self._fpp_cell_delta(new_id, 1.0, x, y, z)
+        if old_id != 0:
+            e += self._fpp_cell_delta(old_id, -1.0, -x, -y, -z)
+        return e
+
     def _d_volume(self, new_id, old_id) -> float:
         e = 0.0
         if new_id != 0:
@@ -78,6 +157,10 @@ class CPUReference:
     def step_mcs(self):
         Lx, Ly, Lz = self.Lx, self.Ly, self.Lz
         nflip = len(self.flip_off)
+        # FPP links are static within a sweep; rebuild the active set once at the
+        # MCS boundary (mirrors the GPU FPPLinks.rebuild() seam).
+        if self._fpp_pairs is not None:
+            self._rebuild_fpp_links()
         for _ in range(self.attempts_per_mcs):
             # source pixel pt; its cell is the candidate value
             px = int(self.rng.integers(0, Lx))
@@ -102,6 +185,7 @@ class CPUReference:
             de = (
                 self._d_volume(src_id, tgt_id)
                 + self._d_contact(tx, ty, tz, src_id, tgt_id)
+                + self._d_fpp(tx, ty, tz, src_id, tgt_id)
             )
             if de <= 0.0:
                 accept = True
@@ -134,6 +218,17 @@ class CPUReference:
     def coms(self) -> np.ndarray:
         v = np.where(self.volume > 0, self.volume, 1.0)
         return np.stack([self.xsum / v, self.ysum / v, self.zsum / v], axis=1)[1:]
+
+    def active_link_lengths(self) -> np.ndarray:
+        """COM-to-COM length of the currently-active FPP links (kept set)."""
+        if self._fpp_pairs is None:
+            return np.zeros(0)
+        self._rebuild_fpp_links()
+        v = np.where(self.volume > 0, self.volume, 1.0)
+        cx, cy, cz = self.xsum / v, self.ysum / v, self.zsum / v
+        a = self._fpp_pairs[self._fpp_keep, 0]
+        b = self._fpp_pairs[self._fpp_keep, 1]
+        return np.sqrt((cx[a] - cx[b]) ** 2 + (cy[a] - cy[b]) ** 2 + (cz[a] - cz[b]) ** 2)
 
     def surface_areas(self, order: int | None = None) -> np.ndarray:
         if order is None:

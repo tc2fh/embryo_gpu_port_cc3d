@@ -83,11 +83,50 @@ class GPUEngine:
         # tracker scratch (allocated lazily)
         self._is_boundary = None
         self._boundary_count = None
-        self._pair_counts = None
+        self._pair_counts = None  # legacy dense path (kept for reference/tests)
+
+        # FocalPointPlasticity (Phase 3). Attached via attach_fpp(); until then the
+        # FPP block in the kernel is disabled and fed length-1 dummy arrays.
+        self.fpp = None
+        self._fpp_dummy_i32 = wp.zeros(1, dtype=wp.int32, device=device)
+        self._fpp_dummy_f32 = wp.zeros(1, dtype=wp.float32, device=device)
+
+        # hashed neighbor-CSR scratch (allocated lazily; replaces the dense matrix)
+        self._ht_key = None
+        self._ht_count = None
+        self._ht_cap = 0
+
+    # ---------------------------------------------------------------- FPP attach
+    def attach_fpp(self, fpp):
+        """Attach an FPPLinks inventory; its per-cell CSR is folded into the
+        Metropolis energy and rebuilt once per MCS (links static within a sweep)."""
+        self.fpp = fpp
+        fpp.rebuild()
+        return fpp
 
     # ------------------------------------------------------------------ sweep
     def step_mcs(self, mcs: int):
-        """One Monte Carlo step: 8 color launches (one full lattice sweep)."""
+        """One Monte Carlo step: 8 color launches (one full lattice sweep).
+
+        FPP links are STATIC within a sweep: if FPP is attached, its per-cell CSR
+        is rebuilt ONCE here (the per-MCS boundary), then read race-free by all 8
+        color kernels. Create/delete of links happens in steppables (which run
+        around the MCS), not inside this inner loop.
+        """
+        if self.fpp is not None and self.fpp.has_links():
+            self.fpp.rebuild()
+            fpp_enabled = 1
+            link_ptr = self.fpp.link_ptr
+            link_other = self.fpp.link_other
+            link_lambda = self.fpp.link_lambda
+            link_target = self.fpp.link_target
+        else:
+            fpp_enabled = 0
+            link_ptr = self._fpp_dummy_i32
+            link_other = self._fpp_dummy_i32
+            link_lambda = self._fpp_dummy_f32
+            link_target = self._fpp_dummy_f32
+
         for color in self.colors:
             wp.launch(
                 K.metropolis_color_kernel,
@@ -101,6 +140,7 @@ class GPUEngine:
                     self.flip_off, self.n_flip,
                     self.Lx, self.Ly, self.Lz,
                     color, mcs, self.base_seed, self.T,
+                    fpp_enabled, link_ptr, link_other, link_lambda, link_target,
                 ],
                 device=self.device,
             )
@@ -169,6 +209,69 @@ class GPUEngine:
         e_contact = float(accum.numpy()[0])
         return e_vol + e_contact
 
+    # ------------------------------------------------ neighbor-contact CSR (hash)
+    def neighbor_contact_csr(self, order: int | None = None):
+        """Common-surface-area CSR between cells, built with a device hash over
+        directed (self,neighbor) pairs -> O(#contacts) memory (NOT the dense
+        (n_cells+1)^2 matrix, which is ~16 GB at 63k cells). Exact: it reproduces
+        the dense/CPU directed contact matrix.
+
+        Returns ``(indptr, indices, data)`` with indices sorted ascending within
+        each source row, indices including Medium (id 0).
+        """
+        if order is None:
+            order = self.cfg.tracker_neighbor_order
+        off = neighbor_offsets(order)
+        off_w = wp.array(off.flatten().astype(np.int32), dtype=wp.int32, device=self.device)
+        n_off = int(off.shape[0])
+        n1 = self.n_cells + 1
+
+        # capacity: a power of two comfortably above the max possible distinct
+        # directed pairs. An upper bound is (#voxels * shell size); we also never
+        # need more than n1*n1. Use the smaller, rounded up to a power of two,
+        # with a 2x load-factor headroom (open addressing needs slack).
+        nvox = self.cfg.n_voxels
+        upper = min(int(nvox) * n_off, int(n1) * int(n1))
+        cap = 1
+        target = max(1024, upper * 2)
+        while cap < target:
+            cap <<= 1
+
+        if self._ht_key is None or self._ht_cap != cap:
+            self._ht_key = wp.zeros(cap, dtype=wp.int64, device=self.device)
+            self._ht_count = wp.zeros(cap, dtype=wp.int32, device=self.device)
+            self._ht_cap = cap
+        self._ht_key.fill_(wp.int64(-1))
+        self._ht_count.zero_()
+
+        wp.launch(
+            K.neighbor_contact_hash_kernel,
+            dim=nvox,
+            inputs=[
+                self.ids, self.Lx, self.Ly, self.Lz,
+                off_w, n_off, wp.int64(n1), cap,
+                self._ht_key, self._ht_count,
+            ],
+            device=self.device,
+        )
+        wp.synchronize()
+
+        key = self._ht_key.numpy()
+        cnt = self._ht_count.numpy()
+        occ = key >= 0
+        keys = key[occ].astype(np.int64)
+        data = cnt[occ].astype(np.int64)
+        src = (keys // n1).astype(np.int64)
+        dst = (keys % n1).astype(np.int64)
+        # sort by (src, dst) so each CSR row's indices are ascending
+        order_idx = np.lexsort((dst, src))
+        src = src[order_idx]; dst = dst[order_idx]; data = data[order_idx]
+        indptr = np.zeros(n1 + 1, dtype=np.int64)
+        # counts per source row -> prefix sum
+        row_counts = np.bincount(src, minlength=n1)[:n1]
+        indptr[1:] = np.cumsum(row_counts)
+        return indptr, dst.astype(np.int64), data.astype(np.int64)
+
     # ------------------------------------------------------ tracker maintenance
     def recompute_trackers(self):
         """Recompute boundary-pixel flags + per-cell boundary count and the
@@ -185,9 +288,7 @@ class GPUEngine:
         if self._is_boundary is None:
             self._is_boundary = wp.zeros(nvox, dtype=wp.int32, device=self.device)
             self._boundary_count = wp.zeros(n1, dtype=wp.int32, device=self.device)
-            self._pair_counts = wp.zeros(n1 * n1, dtype=wp.int32, device=self.device)
         self._boundary_count.zero_()
-        self._pair_counts.zero_()
 
         wp.launch(
             K.boundary_pixel_flag_kernel,
@@ -199,29 +300,11 @@ class GPUEngine:
             ],
             device=self.device,
         )
-        wp.launch(
-            K.neighbor_contact_count_kernel,
-            dim=nvox,
-            inputs=[
-                self.ids, self.Lx, self.Ly, self.Lz,
-                self.tracker_off, self.n_tracker, n1, self._pair_counts,
-            ],
-            device=self.device,
-        )
         wp.synchronize()
 
         boundary_count = self._boundary_count.numpy().copy()
-        dense = self._pair_counts.numpy().reshape(n1, n1)
-        indptr = np.zeros(n1 + 1, dtype=np.int64)
-        indices_list = []
-        data_list = []
-        for cid in range(n1):
-            nz = np.nonzero(dense[cid])[0]
-            indices_list.append(nz)
-            data_list.append(dense[cid][nz])
-            indptr[cid + 1] = indptr[cid] + len(nz)
-        indices = np.concatenate(indices_list) if indices_list else np.zeros(0, np.int64)
-        data = np.concatenate(data_list) if data_list else np.zeros(0, np.int64)
+        # neighbor-contact CSR via the scalable hashed build (no dense n^2 matrix)
+        indptr, indices, data = self.neighbor_contact_csr()
         return {
             "boundary_count": boundary_count,
             "is_boundary": self._is_boundary.numpy().reshape(self.Lz, self.Ly, self.Lx).copy(),

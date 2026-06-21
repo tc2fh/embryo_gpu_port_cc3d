@@ -62,6 +62,78 @@ def get_id(ids: wp.array(dtype=wp.int32),
 
 
 # ---------------------------------------------------------------------------
+# FocalPointPlasticity spring-energy delta (device func)
+# ---------------------------------------------------------------------------
+@wp.func
+def fpp_delta_cell(
+    cid: wp.int32,
+    dvol: wp.float32,
+    dx: wp.float32, dy: wp.float32, dz: wp.float32,
+    xsum: wp.array(dtype=wp.int64),
+    ysum: wp.array(dtype=wp.int64),
+    zsum: wp.array(dtype=wp.int64),
+    volume: wp.array(dtype=wp.float32),
+    link_ptr: wp.array(dtype=wp.int32),
+    link_other: wp.array(dtype=wp.int32),
+    link_lambda: wp.array(dtype=wp.float32),
+    link_target: wp.array(dtype=wp.float32),
+) -> wp.float32:
+    """dE_fpp for shifting cell ``cid`` by (dvol, dx, dy, dz) in its COM
+    accumulators, over its active FPP links.
+
+    Link length L = || COM_cid - COM_other ||_2, with COM read from the engine's
+    int64 xsum/ysum/zsum / volume (the exact, reproducible single source of truth
+    -- no separate COM tracker). Energy per link = lambda*(L - target)^2; the
+    constant ``offset`` cancels in the before/after delta.
+
+    Mirrors FocalPointPlasticityPlugin::potentialFunction + distInvariantCM
+    (plain Euclidean for non-periodic BC). Medium (id 0) has no links.
+    """
+    if cid == 0:
+        return wp.float32(0.0)
+    v0 = volume[cid]
+    if v0 <= 0.0:
+        return wp.float32(0.0)
+    v1 = v0 + dvol
+    if v1 <= 0.0:
+        return wp.float32(0.0)
+    # COM before / after the proposed single-voxel shift (exact float64-of-int math
+    # done in float32 here; identical functional form to the CPU reference)
+    x0 = wp.float64(xsum[cid])
+    y0 = wp.float64(ysum[cid])
+    z0 = wp.float64(zsum[cid])
+    cx0 = wp.float32(x0 / wp.float64(v0))
+    cy0 = wp.float32(y0 / wp.float64(v0))
+    cz0 = wp.float32(z0 / wp.float64(v0))
+    cx1 = wp.float32((x0 + wp.float64(dx)) / wp.float64(v1))
+    cy1 = wp.float32((y0 + wp.float64(dy)) / wp.float64(v1))
+    cz1 = wp.float32((z0 + wp.float64(dz)) / wp.float64(v1))
+    e = wp.float32(0.0)
+    start = link_ptr[cid]
+    end = link_ptr[cid + 1]
+    for k in range(start, end):
+        other = link_other[k]
+        vo = volume[other]
+        if vo <= 0.0:
+            continue
+        ox = wp.float32(wp.float64(xsum[other]) / wp.float64(vo))
+        oy = wp.float32(wp.float64(ysum[other]) / wp.float64(vo))
+        oz = wp.float32(wp.float64(zsum[other]) / wp.float64(vo))
+        lam = link_lambda[k]
+        tgt = link_target[k]
+        b0 = cx0 - ox
+        b1 = cy0 - oy
+        b2 = cz0 - oz
+        lbefore = wp.sqrt(b0 * b0 + b1 * b1 + b2 * b2)
+        a0 = cx1 - ox
+        a1 = cy1 - oy
+        a2 = cz1 - oz
+        lafter = wp.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
+        e += lam * ((lafter - tgt) * (lafter - tgt) - (lbefore - tgt) * (lbefore - tgt))
+    return e
+
+
+# ---------------------------------------------------------------------------
 # Metropolis -- one checkerboard color per launch
 # ---------------------------------------------------------------------------
 @wp.kernel
@@ -85,6 +157,14 @@ def metropolis_color_kernel(
     mcs: wp.int32,
     base_seed: wp.int32,
     temperature: wp.float32,
+    # --- FocalPointPlasticity (Phase 3). fpp_enabled==0 -> no-op (arrays may be
+    #     length-1 dummies). Links are STATIC within a color sweep (rebuilt at the
+    #     per-MCS steppable boundary), so reading the CSR here is race-free. ---
+    fpp_enabled: wp.int32,
+    link_ptr: wp.array(dtype=wp.int32),
+    link_other: wp.array(dtype=wp.int32),
+    link_lambda: wp.array(dtype=wp.float32),
+    link_target: wp.array(dtype=wp.float32),
 ):
     tid = wp.tid()
 
@@ -152,6 +232,22 @@ def metropolis_color_kernel(
             de -= contact[old_t, nt]
         if ncell != new_id:
             de += contact[new_t, nt]
+
+    # ---- FPP spring delta at the SAME changePixel/newCell evaluation point ----
+    # The voxel (x,y,z) leaves old_id and joins new_id (mirrors the apply below).
+    # COM is read from xsum/ysum/zsum / volume (the exact single source of truth).
+    if fpp_enabled != 0:
+        fpx = wp.float32(x)
+        fpy = wp.float32(y)
+        fpz = wp.float32(z)
+        de += fpp_delta_cell(
+            new_id, 1.0, fpx, fpy, fpz,
+            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+        )
+        de += fpp_delta_cell(
+            old_id, -1.0, -fpx, -fpy, -fpz,
+            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+        )
 
     # ---- Metropolis acceptance (DefaultAcceptanceFunction) ----
     accept = False
@@ -321,11 +417,12 @@ def neighbor_contact_count_kernel(
     n_cells_p1: wp.int32,
     pair_counts: wp.array(dtype=wp.int32),         # dense (n_cells+1)^2, atomically summed
 ):
-    """Count directed (self -> neighbor) face-contacts into a dense matrix; this
-    is the common-surface-area between cell pairs (NeighborTracker). Includes
-    self->Medium (id 0). One thread per voxel. The dense matrix is small for the
-    test models; the host compresses the non-zero rows to CSR. (For full Embryo
-    scale this becomes a hashed/segmented build -- noted in findings.)"""
+    """LEGACY dense-matrix neighbor-contact counter (Phase 2). Counts directed
+    (self -> neighbor) face-contacts into a dense (n_cells+1)^2 matrix. Superseded
+    in Phase 3 by ``neighbor_contact_hash_kernel`` (+ ``GPUEngine.neighbor_contact_csr``),
+    an O(#contacts) hashed build that scales to 63k-cell Embryo (the dense matrix
+    is ~16 GB there). Kept for reference / small-scale cross-checks only. Includes
+    self->Medium (id 0). One thread per voxel."""
     i = wp.tid()
     self_id = ids[i]
     x = i % Lx
@@ -339,3 +436,131 @@ def neighbor_contact_count_kernel(
         ncell = get_id(ids, nnx, nny, nnz, Lx, Ly, Lz)
         if ncell != self_id:
             wp.atomic_add(pair_counts, self_id * n_cells_p1 + ncell, 1)
+
+
+# ---------------------------------------------------------------------------
+# FocalPointPlasticity dynamic link CSR: flag/count (delete) + atomic-append
+# (create) -- the proven Phase 1 pattern (gpu_port/phase1/cpm_gpu.py), here with
+# PER-LINK lambda/target/max (CC3D new_fpp_link(cell_a, cell_b, lam, tgt, max)).
+# ---------------------------------------------------------------------------
+@wp.kernel
+def fpp_count_active_links_kernel(
+    pair_a: wp.array(dtype=wp.int32),
+    pair_b: wp.array(dtype=wp.int32),
+    pair_max: wp.array(dtype=wp.float32),
+    xsum: wp.array(dtype=wp.int64),
+    ysum: wp.array(dtype=wp.int64),
+    zsum: wp.array(dtype=wp.int64),
+    volume: wp.array(dtype=wp.float32),
+    keep_flag: wp.array(dtype=wp.int32),
+    degree: wp.array(dtype=wp.int32),
+):
+    """Flag links to keep (COM length <= the link's own max_length) and count the
+    per-cell degree (atomic). A dead cell (volume 0) drops its links. One thread
+    per undirected link."""
+    i = wp.tid()
+    a = pair_a[i]
+    b = pair_b[i]
+    if a < 0 or b < 0:                 # tombstoned (deleted) link slot
+        keep_flag[i] = 0
+        return
+    va = volume[a]
+    vb = volume[b]
+    if va <= 0.0 or vb <= 0.0:
+        keep_flag[i] = 0
+        return
+    ax = wp.float64(xsum[a]) / wp.float64(va)
+    ay = wp.float64(ysum[a]) / wp.float64(va)
+    az = wp.float64(zsum[a]) / wp.float64(va)
+    bx = wp.float64(xsum[b]) / wp.float64(vb)
+    by = wp.float64(ysum[b]) / wp.float64(vb)
+    bz = wp.float64(zsum[b]) / wp.float64(vb)
+    dx = wp.float32(ax - bx)
+    dy = wp.float32(ay - by)
+    dz = wp.float32(az - bz)
+    d = wp.sqrt(dx * dx + dy * dy + dz * dz)
+    if d <= pair_max[i]:
+        keep_flag[i] = 1
+        wp.atomic_add(degree, a, 1)
+        wp.atomic_add(degree, b, 1)
+    else:
+        keep_flag[i] = 0
+
+
+@wp.kernel
+def fpp_fill_csr_kernel(
+    pair_a: wp.array(dtype=wp.int32),
+    pair_b: wp.array(dtype=wp.int32),
+    pair_lambda: wp.array(dtype=wp.float32),
+    pair_target: wp.array(dtype=wp.float32),
+    keep_flag: wp.array(dtype=wp.int32),
+    link_ptr: wp.array(dtype=wp.int32),
+    cursor: wp.array(dtype=wp.int32),
+    link_other: wp.array(dtype=wp.int32),
+    link_lambda: wp.array(dtype=wp.float32),
+    link_target: wp.array(dtype=wp.float32),
+):
+    """Atomic-append each kept undirected link into BOTH endpoints' CSR ranges,
+    carrying the per-link lambda/target so the energy kernel reads them directly.
+    One thread per undirected link."""
+    i = wp.tid()
+    if keep_flag[i] == 0:
+        return
+    a = pair_a[i]
+    b = pair_b[i]
+    lam = pair_lambda[i]
+    tgt = pair_target[i]
+    pa = wp.atomic_add(cursor, a, 1)
+    slot_a = link_ptr[a] + pa
+    link_other[slot_a] = b
+    link_lambda[slot_a] = lam
+    link_target[slot_a] = tgt
+    pb = wp.atomic_add(cursor, b, 1)
+    slot_b = link_ptr[b] + pb
+    link_other[slot_b] = a
+    link_lambda[slot_b] = lam
+    link_target[slot_b] = tgt
+
+
+# ---------------------------------------------------------------------------
+# Scalable neighbor-contact CSR: open-addressing device hash over directed
+# (self,neighbor) pairs -> O(#contacts) memory instead of the dense (n+1)^2
+# matrix (the Phase 2 scale blocker; ~16 GB at 63k cells). Exact: counts are
+# exact, the host compacts the occupied slots and sorts by source to a CSR.
+# ---------------------------------------------------------------------------
+@wp.kernel
+def neighbor_contact_hash_kernel(
+    ids: wp.array(dtype=wp.int32),
+    Lx: wp.int32, Ly: wp.int32, Lz: wp.int32,
+    nbr_off: wp.array(dtype=wp.int32),
+    n_nbr: wp.int32,
+    n_cells_p1: wp.int64,
+    cap: wp.int32,
+    ht_key: wp.array(dtype=wp.int64),      # packed key src*n1+dst, -1 = empty
+    ht_count: wp.array(dtype=wp.int32),    # contact count for that key
+):
+    """For each voxel, for each shell-neighbor of a different cell, insert the
+    packed directed key ``self_id*n1 + ncell`` into the hash table (CAS into an
+    empty slot, linear probing) and atomically bump its count. One thread per
+    voxel. ``cap`` MUST be a power of two and > number of distinct directed pairs."""
+    i = wp.tid()
+    self_id = ids[i]
+    x = i % Lx
+    rem = i / Lx
+    y = rem % Ly
+    z = rem / Ly
+    for n in range(n_nbr):
+        nnx = x + nbr_off[3 * n + 0]
+        nny = y + nbr_off[3 * n + 1]
+        nnz = z + nbr_off[3 * n + 2]
+        ncell = get_id(ids, nnx, nny, nnz, Lx, Ly, Lz)
+        if ncell != self_id:
+            key = wp.int64(self_id) * n_cells_p1 + wp.int64(ncell)
+            # hash (Knuth multiplicative) into [0, cap); cap is a power of two
+            h = wp.int32((key * wp.int64(2654435761)) & wp.int64(cap - 1))
+            for _p in range(cap):
+                slot = (h + _p) & (cap - 1)
+                prev = wp.atomic_cas(ht_key, slot, wp.int64(-1), key)
+                if prev == wp.int64(-1) or prev == key:
+                    wp.atomic_add(ht_count, slot, 1)
+                    break
