@@ -411,3 +411,26 @@ Python. Wrote the definition + a 3-phase, dependency-ordered, fidelity-constrain
   (engine+embryo; high risk: Gumbel/Manhattan exactness + bit-exact-per-replica; biggest sweep-throughput win).
 Scope sections verified parseable by `gate.py::declared_scope`. Docs are uncommitted in the working tree. Awaiting
 "start the phase run" to execute `phase_06`→`07`→`08` per `.claude/workflow.md`.
+
+## Phase 6 — device scans + neighbor-CSR residency + device-authoritative FPP link topology — DONE (complete_with_issues) 2026-06-21
+
+Orchestrated per `.claude/workflow.md` (executor=Opus, summarizer=Sonnet subagents). Gate CLEAN: 191 passed / 3 skip
+(was 100/3; +91 phase-6 tests), 7 files / 1214 lines, in-scope (`gpu_port/engine/` + `gpu_port/phase6/` only),
+non-destructive. Verdict: complete_with_issues / plan_deviation minor / no escalate. Delivered all three:
+(1) **device exclusive-scan** `gpu_port/engine/scan.py` — `exclusive_scan_to_ptr_i32`/`_i64` (wp.utils.array_scan into
+`out[1:]` + cast kernel; no int64 array_scan so scan-in-i32-then-widen) + `segmented_exclusive_scan_to_ptr_i32`
+(per-replica), wired into the 3 cumsum sites (fpp.rebuild link_ptr, engine neighbor-CSR indptr, batched_fpp per-replica
+link_ptr; also batched.py CSR indptr); link_ptr is now a reused buffer (no per-step realloc).
+(2) **additive neighbor-CSR device handles** on GPUEngine: `neighbor_csr_indptr_dev`(i64), `neighbor_csr_indices_dev`(i32),
+`neighbor_csr_data_dev`(i32), `neighbor_csr_n_contacts` — host return UNCHANGED; batched path publishes `_csr_indptr_dev`.
+(3) **device-authoritative FPPLinks**: storage `_a_dev/_b_dev/_lam_dev/_tgt_dev/_max_dev` (wp.array); create=device block-
+append, delete=binary-search keep-mark + compact, `compact_with_keep_mask(keep_dev)` = Phase-7 Poisson-delete seam;
+rebuild() fully on-device. KEY DECISION (the minor deviation): legacy `_a/_b/_lam/_tgt/_max` kept as read-only,
+lazily-synced numpy @property views over the device storage, preserving the read contract of out-of-scope
+`embryo/steppables.py` + existing tests with ZERO out-of-scope edits. Fidelity intact (device scans byte-identical to
+np.cumsum; neighbor-CSR device output byte-identical to host; FPP inventory set-equal to NumPy ref with stable rebuild
+order; Volume+Contact bit-reproducible). **PERF DEBT carried to Phase 7**: steppable_ms ~doubled (~6.5→~13 ms, per-edit
+kernel launches + per-MCS host view of `_a/_b`); csr_ms +~0.6 ms (int64 indptr copyback); sweep_ms flat. Phase 7 reclaims
+it by dropping the CSR host copyback (consume `neighbor_csr_*_dev`), porting steppable create/delete loops to device
+kernels (kills the `_a/_b` host round-trips), and routing Poisson-delete through `compact_with_keep_mask`. NEXT:
+`plan_docs/phase_07_device_link_steppables.md` (Objective items 1-4 + Delivery discipline).

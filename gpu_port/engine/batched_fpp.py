@@ -28,6 +28,7 @@ import numpy as np
 import warp as wp
 
 from . import kernels as K
+from . import scan as S
 
 wp.init()
 
@@ -183,14 +184,14 @@ class BatchedFPPLinks:
             ],
             device=self.device,
         )
-        wp.synchronize()
 
-        # per-replica exclusive prefix sum of degree -> LOCAL link_ptr (host; the
-        # n1 axis is tiny and off the hot per-flip path -- the Phase 1/3 approach).
-        deg = self._degree.numpy().reshape(R, self.n1 + 1)
-        ptr = np.zeros((R, self.n1 + 1), dtype=np.int32)
-        ptr[:, 1:] = np.cumsum(deg[:, : self.n1], axis=1)
-        self.link_ptr = wp.array(ptr.reshape(-1), dtype=wp.int32, device=self.device)
+        # per-replica exclusive prefix sum of degree -> LOCAL link_ptr, ON DEVICE
+        # (Phase 6: replaces the host per-row np.cumsum + per-step realloc). One
+        # thread per replica, each resetting at its segment boundary; byte-identical
+        # to the prior np.cumsum(..., axis=1). link_ptr is a stable reused buffer.
+        self.link_ptr.zero_()
+        S.segmented_exclusive_scan_to_ptr_i32(self._degree, R, self.n1,
+                                              self.link_ptr, self.device)
 
         self._cursor.zero_()
         wp.launch(

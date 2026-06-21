@@ -54,6 +54,7 @@ import warp.utils  # radix_sort_pairs (per-replica neighbor-CSR compaction)
 from .config import EngineConfig, neighbor_offsets
 from .state import EngineState, build_grid_state, state_from_id_lattice
 from . import kernels as K
+from . import scan as S
 
 wp.init()
 
@@ -216,6 +217,7 @@ class BatchedGPUEngine:
         self._csr_keys = None
         self._csr_data = None
         self._csr_indices = None
+        self._csr_indptr_dev = None   # device indptr (n1+1 int64), Phase-6 device scan
 
     def attach_fpp(self, fpp):
         """Attach a ``BatchedFPPLinks``: its per-replica link CSR is rebuilt once per
@@ -284,6 +286,7 @@ class BatchedGPUEngine:
         if self._csr_row_counts is None or self._csr_row_counts.shape[0] < n1 + 1:
             self._csr_row_counts = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
             self._csr_cursor = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
+            self._csr_indptr_dev = wp.zeros(n1 + 1, dtype=wp.int64, device=self.device)
         self._csr_row_counts.zero_()
         wp.launch(
             K.neighbor_csr_count_kernel,
@@ -291,10 +294,13 @@ class BatchedGPUEngine:
             inputs=[ht_key, cap, wp.int64(n1), self._csr_row_counts],
             device=self.device,
         )
+        # exclusive prefix sum of the per-source degree -> indptr, ON DEVICE (Phase 6:
+        # replaces the host np.cumsum; byte-identical, same as the single-engine path).
+        # (The scan fully writes indptr, so no pre-zero needed.)
+        S.exclusive_scan_to_ptr_i64(self._csr_row_counts, n1, self._csr_indptr_dev,
+                                    self.device)
         wp.synchronize()
-        row_counts = self._csr_row_counts.numpy()[:n1]
-        indptr = np.zeros(n1 + 1, dtype=np.int64)
-        indptr[1:] = np.cumsum(row_counts)
+        indptr = self._csr_indptr_dev.numpy()
         n_contacts = int(indptr[-1])
         if n_contacts == 0:
             return indptr, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)

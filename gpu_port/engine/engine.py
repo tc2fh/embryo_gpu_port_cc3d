@@ -30,6 +30,7 @@ import warp.utils  # radix_sort_pairs (global int64 sort for the on-device CSR b
 from .config import EngineConfig, neighbor_offsets
 from .state import EngineState
 from . import kernels as K
+from . import scan as S
 
 wp.init()
 
@@ -103,6 +104,16 @@ class GPUEngine:
         self._csr_keys = None         # dense packed keys src*n1+dst (>= 2*n_contacts int64)
         self._csr_data = None         # dense CSR counts  (>= 2*n_contacts int32)
         self._csr_indices = None      # extracted dst ids (>= n_contacts int32)
+        self._csr_indptr_dev = None   # device indptr (n1+1 int64), Phase-6 device scan
+
+        # Device handles for the most recent neighbor-contact CSR build (Phase 6
+        # deliverable 2: the seam Phase 7 reads to drop the host copyback). These
+        # alias the resident device CSR arrays; ``neighbor_contact_csr`` still
+        # returns its host arrays unchanged, but now also publishes these.
+        self.neighbor_csr_indptr_dev = None    # wp.array int64 (n1+1)
+        self.neighbor_csr_indices_dev = None   # wp.array int32 (n_contacts)
+        self.neighbor_csr_data_dev = None      # wp.array int32 (n_contacts)
+        self.neighbor_csr_n_contacts = 0
 
     # ---------------------------------------------------------------- FPP attach
     def attach_fpp(self, fpp):
@@ -314,6 +325,7 @@ class GPUEngine:
         if self._csr_row_counts is None or self._csr_row_counts.shape[0] < n1 + 1:
             self._csr_row_counts = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
             self._csr_cursor = wp.zeros(n1 + 1, dtype=wp.int32, device=self.device)
+            self._csr_indptr_dev = wp.zeros(n1 + 1, dtype=wp.int64, device=self.device)
         self._csr_row_counts.zero_()
 
         wp.launch(
@@ -322,15 +334,23 @@ class GPUEngine:
             inputs=[self._ht_key, cap, wp.int64(n1), self._csr_row_counts],
             device=self.device,
         )
-        wp.synchronize()
 
-        # exclusive prefix sum of the per-source degree -> indptr (host; n1 is tiny
-        # and off the hot per-flip path -- the FPP-build approach).
-        row_counts = self._csr_row_counts.numpy()[:n1]
-        indptr = np.zeros(n1 + 1, dtype=np.int64)
-        indptr[1:] = np.cumsum(row_counts)
+        # exclusive prefix sum of the per-source degree -> indptr, ON DEVICE (Phase 6:
+        # replaces the host np.cumsum). int64 to match the return dtype; byte-identical
+        # to the prior cumsum. indptr stays resident (the Phase-7 device handle); only
+        # the tiny n1+1 array is copied back, to read n_contacts and keep the host
+        # return contract. (The scan fully writes indptr, so no pre-zero needed.)
+        S.exclusive_scan_to_ptr_i64(self._csr_row_counts, n1, self._csr_indptr_dev,
+                                    self.device)
+        wp.synchronize()
+        indptr = self._csr_indptr_dev.numpy()
         n_contacts = int(indptr[-1])
         if n_contacts == 0:
+            empty = wp.zeros(0, dtype=wp.int32, device=self.device)
+            self.neighbor_csr_indptr_dev = self._csr_indptr_dev
+            self.neighbor_csr_indices_dev = empty
+            self.neighbor_csr_data_dev = empty
+            self.neighbor_csr_n_contacts = 0
             return indptr, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
 
         # dense sort buffers (cached, grown on demand). radix_sort_pairs double-
@@ -367,6 +387,15 @@ class GPUEngine:
 
         indices = self._csr_indices.numpy().astype(np.int64)               # Medium 0 included
         data = self._csr_data[:n_contacts].numpy().astype(np.int64)        # slice off the 2x buffer
+
+        # publish the resident device handles (Phase 6 deliverable 2). These are
+        # exactly the arrays the host return is .numpy()'d from: indptr int64
+        # (n1+1), indices int32 (n_contacts), data int32 (n_contacts, sliced off the
+        # 2x radix double-buffer). The host return above is unchanged.
+        self.neighbor_csr_indptr_dev = self._csr_indptr_dev
+        self.neighbor_csr_indices_dev = self._csr_indices[:n_contacts]
+        self.neighbor_csr_data_dev = self._csr_data[:n_contacts]
+        self.neighbor_csr_n_contacts = n_contacts
         return indptr, indices, data
 
     # ------------------------------------------------------ tracker maintenance

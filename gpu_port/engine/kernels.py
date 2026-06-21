@@ -1441,3 +1441,147 @@ def neighbor_csr_extract_dst_kernel(
 # which CUB serviced poorly given ~n1 tiny, highly skewed segments (~7 ms -> <1 ms).
 # A per-row comparison-sort kernel was tried first and removed: O(k^2) per row, and
 # the one giant Medium row serialized onto a single thread dominated the whole build.
+
+
+# ---------------------------------------------------------------------------
+# Device exclusive prefix-sum -> CSR row pointer (Phase 6). Replaces the host
+# ``np.cumsum`` + ``wp.array`` realloc that every per-MCS CSR build (FPP link_ptr,
+# neighbor-CSR indptr, batched per-replica link_ptr) used. The contract is the
+# CSR-pointer form: given a per-row ``degree`` array (length n+1, only [0:n] read),
+# write ``out_ptr`` (length n+1) with ``out_ptr[0]=0`` and
+# ``out_ptr[k] = sum(degree[0:k])`` for k in 1..n -- i.e. the int64-exact
+# exclusive prefix shifted into [1:n+1] (BYTE-IDENTICAL to
+# ``out[1:]=np.cumsum(degree[:n])``). Integer adds are associative, so a sequential
+# accumulate is bit-for-bit the same as NumPy regardless of evaluation order.
+#
+# Two flavors:
+#   * the neighbor-CSR indptr is int64 (the ``neighbor_contact_csr`` return dtype),
+#     but ``wp.utils.array_scan`` only supports int32/float. So we run the parallel
+#     int32 ``array_scan`` into an int32 scratch and ``cast_i32_to_i64_kernel`` the
+#     result up to int64 -- both parallel (a single-thread sequential scan over the
+#     ~n_cells-long n axis was a measurable per-MCS regression). n_contacts is bounded
+#     by ``min(nvox*shell, n1*n1)`` and already sizes int32-indexed buffers elsewhere,
+#     so the int32 prefix never overflows for any scene the rest of the build handles.
+#   * ``segmented_exclusive_scan_to_ptr_i32_kernel`` -- R independent segments, one
+#     thread per replica, each resetting its accumulator at its segment boundary
+#     (the per-replica ``link_ptr`` reset). int32 to match the FPP link_ptr dtype.
+# For the single int32 FPP link_ptr we reuse ``wp.utils.array_scan`` (inclusive scan
+# into the ``out_ptr[1:]`` slice == the same shifted exclusive prefix; verified
+# byte-identical) -- a parallel scan with no extra kernel to maintain.
+# ---------------------------------------------------------------------------
+@wp.kernel
+def cast_i32_to_i64_kernel(
+    src: wp.array(dtype=wp.int32),
+    n: wp.int32,
+    dst: wp.array(dtype=wp.int64),
+):
+    """One thread per element: widen int32 -> int64. Used to promote the parallel
+    int32 prefix-sum to the int64 neighbor-CSR indptr (array_scan has no int64)."""
+    i = wp.tid()
+    if i >= n:
+        return
+    dst[i] = wp.int64(src[i])
+
+
+@wp.kernel
+def segmented_exclusive_scan_to_ptr_i32_kernel(
+    degree: wp.array(dtype=wp.int32),   # (R*(n1+1),); per replica only [0:n1] read
+    R: wp.int32, n1: wp.int32,
+    out_ptr: wp.array(dtype=wp.int32),  # (R*(n1+1),) per-replica LOCAL row pointer
+):
+    """Per-replica (segmented) exclusive prefix-sum into per-replica LOCAL CSR row
+    pointers. One thread per replica; each resets its accumulator at its segment
+    start, so segment ``r`` gets ``out[base]=0, out[base+1+k]=sum(deg[base:base+1+k])``
+    -- byte-identical to ``out[:,1:]=np.cumsum(deg[:,:n1],axis=1)``."""
+    r = wp.tid()
+    if r >= R:
+        return
+    base = r * (n1 + 1)
+    acc = wp.int32(0)
+    out_ptr[base] = wp.int32(0)
+    for k in range(n1):
+        acc += degree[base + k]
+        out_ptr[base + k + 1] = acc
+
+
+# ---------------------------------------------------------------------------
+# Device-authoritative FPP link inventory edits (Phase 6 deliverable 3). The link
+# arrays (a/b/lam/tgt/max) live on the GPU; create = append (a contiguous block
+# write at a host-reserved base, order-preserving), delete = a keep/compact driven
+# by a device decision MASK. The compact is the seam Phase 7's Poisson-delete wires
+# in: it hands a device keep-mask, this scatters survivors. Stable: each survivor's
+# destination is the EXCLUSIVE prefix-sum of the keep-mask, so relative order (=
+# insertion order) is preserved -> deterministic downstream CSR offsets.
+# ---------------------------------------------------------------------------
+@wp.kernel
+def fpp_compact_links_kernel(
+    keep: wp.array(dtype=wp.int32),       # (m,) 1 = survive, 0 = drop (the decision mask)
+    dst: wp.array(dtype=wp.int32),        # (m,) exclusive prefix-sum of keep = new index
+    m: wp.int32,
+    a_in: wp.array(dtype=wp.int32), b_in: wp.array(dtype=wp.int32),
+    lam_in: wp.array(dtype=wp.float32), tgt_in: wp.array(dtype=wp.float32),
+    max_in: wp.array(dtype=wp.float32),
+    a_out: wp.array(dtype=wp.int32), b_out: wp.array(dtype=wp.int32),
+    lam_out: wp.array(dtype=wp.float32), tgt_out: wp.array(dtype=wp.float32),
+    max_out: wp.array(dtype=wp.float32),
+):
+    """One thread per inventory slot: kept slots copy their 5 link fields to their
+    compacted position ``dst[i]`` (the keep-mask exclusive prefix). Order-stable, so
+    the surviving inventory keeps insertion order."""
+    i = wp.tid()
+    if i >= m:
+        return
+    if keep[i] == 0:
+        return
+    j = dst[i]
+    a_out[j] = a_in[i]
+    b_out[j] = b_in[i]
+    lam_out[j] = lam_in[i]
+    tgt_out[j] = tgt_in[i]
+    max_out[j] = max_in[i]
+
+
+@wp.kernel
+def fpp_mark_keep_by_key_kernel(
+    a: wp.array(dtype=wp.int32), b: wp.array(dtype=wp.int32),
+    m: wp.int32, mult: wp.int64,
+    del_keys: wp.array(dtype=wp.int64),   # SORTED unique packed lo*mult+hi delete keys
+    n_del: wp.int32,
+    keep: wp.array(dtype=wp.int32),       # (m,) out: 1 = survive, 0 = matched a delete key
+):
+    """One thread per inventory slot: pack the slot's unordered {a,b} into
+    ``lo*mult+hi`` and binary-search the sorted delete-key list; a hit -> keep=0.
+    Tombstoned (a<0) slots are dropped too. The device analogue of the host
+    ``np.isin`` that ``delete_links_bulk`` used to mask with."""
+    i = wp.tid()
+    if i >= m:
+        return
+    ai = a[i]
+    bi = b[i]
+    if ai < 0 or bi < 0:
+        keep[i] = 0
+        return
+    lo = wp.int64(ai)
+    hi = wp.int64(bi)
+    if bi < ai:
+        lo = wp.int64(bi)
+        hi = wp.int64(ai)
+    key = lo * mult + hi
+    # binary search in the sorted del_keys
+    left = int(0)
+    right = int(n_del)
+    found = int(0)
+    while left < right:
+        mid = (left + right) / 2
+        v = del_keys[mid]
+        if v == key:
+            found = 1
+            left = right
+        elif v < key:
+            left = mid + 1
+        else:
+            right = mid
+    if found == 1:
+        keep[i] = 0
+    else:
+        keep[i] = 1
