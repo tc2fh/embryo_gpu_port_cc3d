@@ -84,6 +84,38 @@ def _bernoulli(n, prob, mcs, base_seed, stream, device):
     return dec.numpy()
 
 
+def _grouped_csr_neighbors(indptr, indices, cells, keep_fn):
+    """Per-cell neighbor lists from a CSR, computed in ONE vectorized pass.
+
+    Gathers the CSR rows of every cell in ``cells`` into a single flat array, applies
+    ``keep_fn`` (a vectorized predicate over the flat neighbor-id array) once, then
+    splits the survivors back into a dict ``{cell_id -> int64 array}`` preserving each
+    row's original (ascending) order. This replaces a Python loop that sliced + masked
+    each of the ~hundreds of cells separately (the dominant per-MCS host cost at full
+    Embryo scale: ~6.4 ms for 618 cells), with no change to the returned arrays.
+    """
+    cells = np.asarray(cells, dtype=np.int64)
+    if cells.shape[0] == 0:
+        return {}
+    lo = indptr[cells].astype(np.int64)
+    hi = indptr[cells + 1].astype(np.int64)
+    counts = hi - lo
+    n = int(counts.sum())
+    if n == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return {int(c): empty for c in cells}
+    # flat positions = concat of arange(lo_i, hi_i) for each cell i (vectorized)
+    owner = np.repeat(np.arange(cells.shape[0]), counts)
+    within = np.arange(n, dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+    nb_all = indices[np.repeat(lo, counts) + within]
+    keep = keep_fn(nb_all)
+    nb_kept = nb_all[keep].astype(np.int64)
+    owner_kept = owner[keep]
+    kept_counts = np.bincount(owner_kept, minlength=cells.shape[0])
+    parts = np.split(nb_kept, np.cumsum(kept_counts)[:-1])
+    return {int(cells[i]): parts[i] for i in range(cells.shape[0])}
+
+
 def neighbor_adjacency(engine: GPUEngine, exclude_types=(), csr=None,
                        cells=None, cell_type=None):
     """Per-cell list of order-1 common-surface neighbor cell ids (excluding Medium
@@ -110,17 +142,14 @@ def neighbor_adjacency(engine: GPUEngine, exclude_types=(), csr=None,
         cell_type = engine.cell_type.numpy()
     excl = np.array(sorted({int(t) for t in exclude_types}), dtype=cell_type.dtype)
     if cells is None:
-        cells = range(1, engine.n_cells + 1)
-    adj = {}
-    for c in cells:
-        c = int(c)
-        lo, hi = int(indptr[c]), int(indptr[c + 1])
-        nb = indices[lo:hi]
-        nb = nb[nb != 0]                          # drop Medium
-        if excl.size:
-            nb = nb[~np.isin(cell_type[nb], excl)]
-        adj[c] = nb.astype(np.int64)
-    return adj
+        cells = np.arange(1, engine.n_cells + 1, dtype=np.int64)
+    if excl.size:
+        def keep_fn(nb):                              # drop Medium + excluded types
+            return (nb != 0) & ~np.isin(cell_type[nb], excl)
+    else:
+        def keep_fn(nb):
+            return nb != 0
+    return _grouped_csr_neighbors(indptr, indices, cells, keep_fn)
 
 
 class TissueLinkSteppable(GPUSteppable):
@@ -269,6 +298,7 @@ class PassiveSubstrateSteppable(GPUSteppable):
         self.passive_type = int(passive_type)
         self.substrate_type = int(substrate_type)
         ctype = engine.cell_type.numpy()
+        self._cell_type = ctype  # static (cells never change type) -> cache, don't re-copy
         self.passive = np.nonzero(ctype == self.passive_type)[0].astype(np.int64)
         self.cell_dict.register("sub_link", "int32", 0)  # cell.dict['link'] mirror
         self.shared_csr = None
@@ -278,16 +308,12 @@ class PassiveSubstrateSteppable(GPUSteppable):
             indptr, indices, _ = self.engine.neighbor_contact_csr(order=1)
         else:
             indptr, indices, _ = self.shared_csr
-        ctype = self.engine.cell_type.numpy()
-        out = {}
-        for c in self.passive:
-            c = int(c)
-            lo, hi = int(indptr[c]), int(indptr[c + 1])
-            nb = indices[lo:hi]
-            nb = nb[(nb != 0)]
-            sub = nb[ctype[nb] == self.substrate_type]
-            out[c] = sub
-        return out
+        ctype = self._cell_type
+        st = self.substrate_type
+
+        def keep_fn(nb):                              # keep only Substrate neighbors
+            return (nb != 0) & (ctype[nb] == st)
+        return _grouped_csr_neighbors(indptr, indices, self.passive, keep_fn)
 
     def start(self):
         if not self.p.if_passive_substrate:
