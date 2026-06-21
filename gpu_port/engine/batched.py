@@ -114,6 +114,7 @@ class BatchedGPUEngine:
         state: BatchedState,
         per_replica_config=None,
         device: str = "cuda:0",
+        fpp_com_snapshot: bool = True,
     ):
         """``state`` carries R replica lattices + shared topology. ``per_replica_config``
         (optional) is a length-R list of ``EngineConfig`` whose SWEPT fields
@@ -206,6 +207,15 @@ class BatchedGPUEngine:
         self.fpp = None
         self._fpp_dummy_i32 = wp.zeros(1, dtype=wp.int32, device=device)
         self._fpp_dummy_f32 = wp.zeros(1, dtype=wp.float32, device=device)
+        # Phase 8: per-sweep COM/volume snapshot the batched FPP spring reads (frozen
+        # pre-sweep copy -> bit-reproducible-per-replica FPP, no read of a mid-updated
+        # COM accumulator). Disjoint per-replica slices (R*n1), so no cross-replica
+        # interaction. fpp_com_snapshot=False aliases the live arrays (prior path).
+        self.fpp_com_snapshot = bool(fpp_com_snapshot)
+        self._fpp_snap_xsum = None
+        self._fpp_snap_ysum = None
+        self._fpp_snap_zsum = None
+        self._fpp_snap_volume = None
 
         # batched neighbor-contact CSR scratch (Tier 2a). Per-replica hash region +
         # the single-replica compaction scratch reused across the per-replica loop.
@@ -218,6 +228,19 @@ class BatchedGPUEngine:
         self._csr_data = None
         self._csr_indices = None
         self._csr_indptr_dev = None   # device indptr (n1+1 int64), Phase-6 device scan
+
+        # batched keyed-global-sort CSR scratch + device handles (Phase 8, Objective 2).
+        # The batched CSR is one big CSR over R*n1 global rows (row r*n1+cid).
+        self._gcsr_row_counts = None
+        self._gcsr_cursor = None
+        self._gcsr_indptr = None
+        self._gcsr_keys = None
+        self._gcsr_data = None
+        self._gcsr_indices = None
+        self.csr_indptr_dev = None    # (R*n1+1) int64 GLOBAL CSR row pointer
+        self.csr_indices_dev = None   # (n_contacts) int32 dst ids
+        self.csr_n_contacts = 0
+        self.csr_nrows = 0
 
     def attach_fpp(self, fpp):
         """Attach a ``BatchedFPPLinks``: its per-replica link CSR is rebuilt once per
@@ -278,6 +301,107 @@ class BatchedGPUEngine:
             cs = self._bht_count[r * cap:(r + 1) * cap]
             out.append(self._compact_csr_slice(ks, cs, cap, n1))
         return out
+
+    def publish_neighbor_csr_device(self, order: int | None = None):
+        """Batched neighbor-CSR via ONE keyed global radix sort (Phase 8, Objective 2):
+        build all R replicas' contact CSR with a SINGLE sort (replica id packed in the
+        key's high bits -> disjoint per-replica ranges) + ONE global exclusive scan,
+        and publish DEVICE handles (no per-replica host loop, no host copyback):
+
+          * ``csr_indptr_dev``  : (R*n1+1) int64 GLOBAL CSR row pointer. Row ``r*n1+c``
+            holds cell ``c``'s out-neighbors in replica ``r``. Cumulative across all
+            replicas (replica r's block is contiguous, because the sort grouped by r).
+          * ``csr_indices_dev`` : (n_contacts) int32 dst ids (the global indices array).
+          * ``csr_n_contacts``  : total #directed contacts across all replicas.
+
+        These are exactly the seam the batched device link/cohesotaxis kernels read per
+        (replica, cell). Returns ``n_contacts``."""
+        if order is None:
+            order = self.cfg.tracker_neighbor_order
+        off = neighbor_offsets(order)
+        off_w = wp.array(off.flatten().astype(np.int32), dtype=wp.int32, device=self.device)
+        n_off = int(off.shape[0])
+        n1 = self.n1
+        nvox = self.nvox
+        R = self.R
+
+        upper = min(int(nvox) * n_off, int(n1) * int(n1))
+        cap = 1
+        target = max(1024, upper * 2)
+        while cap < target:
+            cap <<= 1
+        if self._bht_key is None or self._bht_cap != cap:
+            self._bht_key = wp.zeros(R * cap, dtype=wp.int64, device=self.device)
+            self._bht_count = wp.zeros(R * cap, dtype=wp.int32, device=self.device)
+            self._bht_cap = cap
+        self._bht_key.fill_(wp.int64(-1))
+        self._bht_count.zero_()
+        wp.launch(
+            K.neighbor_contact_hash_batched_kernel,
+            dim=R * nvox,
+            inputs=[self.ids, self.Lx, self.Ly, self.Lz, nvox, R,
+                    off_w, n_off, wp.int64(n1), cap, self._bht_key, self._bht_count],
+            device=self.device,
+        )
+
+        # global-row degree (R*n1 rows) + global append cursor
+        nrows = R * n1
+        if (self._gcsr_row_counts is None or
+                self._gcsr_row_counts.shape[0] < nrows + 1):
+            self._gcsr_row_counts = wp.zeros(nrows + 1, dtype=wp.int32, device=self.device)
+            self._gcsr_cursor = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._gcsr_indptr = wp.zeros(nrows + 1, dtype=wp.int64, device=self.device)
+        self._gcsr_row_counts.zero_()
+        self._gcsr_cursor.zero_()
+
+        # compact all R hash regions into one dense array with replica-keyed global keys
+        upper_contacts = R * cap
+        if self._gcsr_keys is None or self._gcsr_keys.shape[0] < 2 * upper_contacts:
+            # provisional sizing; resized precisely once n_contacts is known
+            self._gcsr_keys = wp.zeros(max(8, 2 * upper_contacts), dtype=wp.int64, device=self.device)
+            self._gcsr_data = wp.zeros(max(8, 2 * upper_contacts), dtype=wp.int32, device=self.device)
+        wp.launch(
+            K.neighbor_csr_compact_batched_global_kernel,
+            dim=R * cap,
+            inputs=[self._bht_key, self._bht_count, R, cap, wp.int64(n1),
+                    self._gcsr_cursor, self._gcsr_keys, self._gcsr_data],
+            device=self.device,
+        )
+        wp.synchronize()
+        n_contacts = int(self._gcsr_cursor.numpy()[0])
+        if n_contacts == 0:
+            self.csr_indptr_dev = self._gcsr_indptr
+            self.csr_indptr_dev.zero_()
+            self.csr_indices_dev = wp.zeros(0, dtype=wp.int32, device=self.device)
+            self.csr_n_contacts = 0
+            self.csr_nrows = nrows
+            return 0
+
+        # count per global-row degree from the (unsorted) compacted keys
+        wp.launch(
+            K.neighbor_csr_count_global_kernel,
+            dim=n_contacts,
+            inputs=[self._gcsr_keys, n_contacts, wp.int64(n1), self._gcsr_row_counts],
+            device=self.device,
+        )
+        # ONE global exclusive scan over all R*n1 rows -> global indptr (int64)
+        S.exclusive_scan_to_ptr_i64(self._gcsr_row_counts, nrows, self._gcsr_indptr,
+                                    self.device)
+        # ONE global radix sort: ascending global key == (replica, src) major, dst asc
+        wp.utils.radix_sort_pairs(self._gcsr_keys, self._gcsr_data, n_contacts)
+        if self._gcsr_indices is None or self._gcsr_indices.shape[0] < n_contacts:
+            self._gcsr_indices = wp.zeros(n_contacts, dtype=wp.int32, device=self.device)
+        wp.launch(
+            K.neighbor_csr_extract_dst_global_kernel,
+            dim=n_contacts,
+            inputs=[self._gcsr_keys, n_contacts, wp.int64(n1), self._gcsr_indices],
+            device=self.device,
+        )
+        self.csr_indptr_dev = self._gcsr_indptr
+        self.csr_indices_dev = self._gcsr_indices[:n_contacts]
+        self.csr_n_contacts = n_contacts
+        self.csr_nrows = nrows
+        return n_contacts
 
     def _compact_csr_slice(self, ht_key, ht_count, cap: int, n1: int):
         """Compact one replica's hash slice into (indptr, indices, data) -- the exact
@@ -380,6 +504,27 @@ class BatchedGPUEngine:
             assert c.flip_neighbor_order == base.flip_neighbor_order, \
                 f"replica {r} flip_neighbor_order differs"
 
+    # ----------------------------------------------------------- FPP COM snapshot
+    def _refresh_fpp_snapshot(self):
+        """Copy the live per-replica COM/volume into the per-sweep FPP snapshot (Phase
+        8). Disjoint per-replica slices, so each replica's spring reads only its own
+        frozen COM -> bit-reproducible per replica. Returns the live arrays (alias) if
+        the snapshot is off (prior path)."""
+        if not self.fpp_com_snapshot:
+            return self.xsum, self.ysum, self.zsum, self.volume
+        n = self.R * self.n1
+        if self._fpp_snap_xsum is None:
+            self._fpp_snap_xsum = wp.zeros(n, dtype=wp.int64, device=self.device)
+            self._fpp_snap_ysum = wp.zeros(n, dtype=wp.int64, device=self.device)
+            self._fpp_snap_zsum = wp.zeros(n, dtype=wp.int64, device=self.device)
+            self._fpp_snap_volume = wp.zeros(n, dtype=wp.float32, device=self.device)
+        wp.copy(self._fpp_snap_xsum, self.xsum)
+        wp.copy(self._fpp_snap_ysum, self.ysum)
+        wp.copy(self._fpp_snap_zsum, self.zsum)
+        wp.copy(self._fpp_snap_volume, self.volume)
+        return (self._fpp_snap_xsum, self._fpp_snap_ysum,
+                self._fpp_snap_zsum, self._fpp_snap_volume)
+
     # ------------------------------------------------------------------ sweep
     def step_mcs(self, mcs: int):
         """One Monte Carlo step for ALL replicas: 8 color launches over R*voxels.
@@ -395,6 +540,7 @@ class BatchedGPUEngine:
             link_lambda = self.fpp.link_lambda
             link_target = self.fpp.link_target
             pay_stride = self.fpp.link_pay_stride
+            snap_x, snap_y, snap_z, snap_v = self._refresh_fpp_snapshot()
         else:
             fpp_enabled = 0
             link_ptr = self._fpp_dummy_i32
@@ -402,6 +548,8 @@ class BatchedGPUEngine:
             link_lambda = self._fpp_dummy_f32
             link_target = self._fpp_dummy_f32
             pay_stride = 1
+            snap_x, snap_y, snap_z, snap_v = (
+                self.xsum, self.ysum, self.zsum, self.volume)
 
         dim = self.R * self._color_threads
         for color in self.colors:
@@ -422,6 +570,7 @@ class BatchedGPUEngine:
                     color, mcs, self.base_seed_r, self.temperature,
                     fpp_enabled, link_ptr, link_other, link_lambda, link_target,
                     pay_stride,
+                    snap_x, snap_y, snap_z, snap_v,
                 ],
                 device=self.device,
             )

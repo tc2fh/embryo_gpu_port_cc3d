@@ -81,10 +81,13 @@ def fpp_delta_cell(
     """dE_fpp for shifting cell ``cid`` by (dvol, dx, dy, dz) in its COM
     accumulators, over its active FPP links.
 
-    Link length L = || COM_cid - COM_other ||_2, with COM read from the engine's
-    int64 xsum/ysum/zsum / volume (the exact, reproducible single source of truth
-    -- no separate COM tracker). Energy per link = lambda*(L - target)^2; the
-    constant ``offset`` cancels in the before/after delta.
+    Link length L = || COM_cid - COM_other ||_2, with COM read from
+    ``xsum/ysum/zsum / volume``. These are the engine's int64 fixed-point COM
+    accumulators -- but in the Metropolis sweep the caller passes the per-sweep COM
+    SNAPSHOT (Phase 8), a frozen pre-sweep copy, so the spring length is a pure
+    function of (pre-sweep COMs + the proposed flip) and never reads a COM accumulator
+    that a concurrent same-color flip is mid-updating. Energy per link =
+    lambda*(L - target)^2; the constant ``offset`` cancels in the before/after delta.
 
     Mirrors FocalPointPlasticityPlugin::potentialFunction + distInvariantCM
     (plain Euclidean for non-periodic BC). Medium (id 0) has no links.
@@ -153,7 +156,11 @@ def fpp_delta_cell_b(
     """Replica-aware copy of ``fpp_delta_cell``: identical spring-energy math, but
     every per-cell read is offset by ``cell_base`` and every CSR read by
     ``ptr_base`` (link_ptr) / ``pay_base`` (link_other/lambda/target). With all bases
-    0 it is byte-identical to the single-replica func -> batched R=1 == single."""
+    0 it is byte-identical to the single-replica func -> batched R=1 == single.
+
+    Phase 8: the caller passes the per-sweep COM/volume SNAPSHOT slice (frozen
+    pre-sweep copy) as ``xsum/ysum/zsum/volume`` so the spring length is deterministic
+    (no read of a mid-updated per-replica COM accumulator)."""
     if cid == 0:
         return wp.float32(0.0)
     v0 = volume[cell_base + cid]
@@ -228,6 +235,14 @@ def metropolis_color_kernel(
     link_other: wp.array(dtype=wp.int32),
     link_lambda: wp.array(dtype=wp.float32),
     link_target: wp.array(dtype=wp.float32),
+    # Phase 8: per-sweep COM/volume SNAPSHOT the FPP spring reads (frozen pre-sweep
+    # copy -> deterministic spring length, no read of a mid-updated COM accumulator).
+    # When the snapshot is disabled the host aliases these to the LIVE arrays, so the
+    # kernel is byte-identical to the prior racy path (the differential flag).
+    fpp_xsum: wp.array(dtype=wp.int64),
+    fpp_ysum: wp.array(dtype=wp.int64),
+    fpp_zsum: wp.array(dtype=wp.int64),
+    fpp_volume: wp.array(dtype=wp.float32),
 ):
     tid = wp.tid()
 
@@ -305,11 +320,13 @@ def metropolis_color_kernel(
         fpz = wp.float32(z)
         de += fpp_delta_cell(
             new_id, 1.0, fpx, fpy, fpz,
-            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+            fpp_xsum, fpp_ysum, fpp_zsum, fpp_volume,
+            link_ptr, link_other, link_lambda, link_target,
         )
         de += fpp_delta_cell(
             old_id, -1.0, -fpx, -fpy, -fpz,
-            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+            fpp_xsum, fpp_ysum, fpp_zsum, fpp_volume,
+            link_ptr, link_other, link_lambda, link_target,
         )
 
     # ---- Metropolis acceptance (DefaultAcceptanceFunction) ----
@@ -322,7 +339,7 @@ def metropolis_color_kernel(
     if not accept:
         return
 
-    # ---- apply: lattice write + atomic SoA updates ----
+    # ---- apply: lattice write + atomic SoA updates (LIVE arrays) ----
     ids[target_idx] = new_id
     fx = wp.int64(x)
     fy = wp.int64(y)
@@ -394,6 +411,11 @@ def metropolis_color_dev_mcs_kernel(
     link_other: wp.array(dtype=wp.int32),
     link_lambda: wp.array(dtype=wp.float32),
     link_target: wp.array(dtype=wp.float32),
+    # Phase 8 per-sweep COM/volume snapshot (see metropolis_color_kernel).
+    fpp_xsum: wp.array(dtype=wp.int64),
+    fpp_ysum: wp.array(dtype=wp.int64),
+    fpp_zsum: wp.array(dtype=wp.int64),
+    fpp_volume: wp.array(dtype=wp.float32),
 ):
     tid = wp.tid()
 
@@ -462,11 +484,13 @@ def metropolis_color_dev_mcs_kernel(
         fpz = wp.float32(z)
         de += fpp_delta_cell(
             new_id, 1.0, fpx, fpy, fpz,
-            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+            fpp_xsum, fpp_ysum, fpp_zsum, fpp_volume,
+            link_ptr, link_other, link_lambda, link_target,
         )
         de += fpp_delta_cell(
             old_id, -1.0, -fpx, -fpy, -fpz,
-            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+            fpp_xsum, fpp_ysum, fpp_zsum, fpp_volume,
+            link_ptr, link_other, link_lambda, link_target,
         )
 
     accept = False
@@ -574,6 +598,11 @@ def metropolis_color_batched_kernel(
     link_lambda: wp.array(dtype=wp.float32),
     link_target: wp.array(dtype=wp.float32),
     link_pay_stride: wp.int32,
+    # Phase 8 per-sweep COM/volume snapshot (R*n1; aliased to live when disabled).
+    fpp_xsum: wp.array(dtype=wp.int64),
+    fpp_ysum: wp.array(dtype=wp.int64),
+    fpp_zsum: wp.array(dtype=wp.int64),
+    fpp_volume: wp.array(dtype=wp.float32),
 ):
     gid = wp.tid()
     r = gid / color_threads
@@ -664,11 +693,13 @@ def metropolis_color_batched_kernel(
         pay_base = r * link_pay_stride
         de += fpp_delta_cell_b(
             new_id, 1.0, fpx, fpy, fpz, cell_base, ptr_base, pay_base,
-            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+            fpp_xsum, fpp_ysum, fpp_zsum, fpp_volume,
+            link_ptr, link_other, link_lambda, link_target,
         )
         de += fpp_delta_cell_b(
             old_id, -1.0, -fpx, -fpy, -fpz, cell_base, ptr_base, pay_base,
-            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+            fpp_xsum, fpp_ysum, fpp_zsum, fpp_volume,
+            link_ptr, link_other, link_lambda, link_target,
         )
 
     # ---- Metropolis acceptance (DefaultAcceptanceFunction) ----
@@ -1432,6 +1463,78 @@ def neighbor_csr_extract_dst_kernel(
     if i >= n:
         return
     out_dst[i] = wp.int32(keys[i] % n_cells_p1)
+
+
+# ---------------------------------------------------------------------------
+# BATCHED neighbor-CSR via ONE keyed global radix sort (Phase 8, Objective 2).
+# The per-replica hash regions are compacted into a SINGLE dense array whose key
+# packs the replica id in the high bits: ``key = (r*n1 + src)*n1 + dst``. One global
+# radix sort then groups by replica (high bits) -> by source row -> dst ascending, so
+# the batched CSR is one big CSR over ``R*n1`` rows (row ``r*n1 + cid``) with a global
+# indptr. This replaces the per-replica ``for r in range(R)`` compact+radix_sort+sync
+# loop (the O(R) host cost) with a single sort + a single segmented (global) scan.
+# Disjoint per-replica key ranges == the bit-exact-per-replica invariant.
+# ---------------------------------------------------------------------------
+@wp.kernel
+def neighbor_csr_compact_batched_global_kernel(
+    ht_key: wp.array(dtype=wp.int64),      # (R*cap,) per-replica hash regions, key=src*n1+dst
+    ht_count: wp.array(dtype=wp.int32),
+    R: wp.int32,
+    cap: wp.int32,
+    n1: wp.int64,
+    cursor: wp.array(dtype=wp.int32),      # ONE global append counter (len>=1), zeroed
+    out_keys: wp.array(dtype=wp.int64),    # global key (r*n1+src)*n1+dst
+    out_data: wp.array(dtype=wp.int32),
+):
+    """One thread per (replica, hash slot): stream each occupied (key, count) into a
+    dense global array, re-packing the key with the replica id in the high bits so a
+    single global radix sort yields disjoint per-replica, src-major, dst-ascending
+    order. ``src``/``dst`` recovered from the per-region key ``src*n1+dst``."""
+    gid = wp.tid()
+    r = gid / cap
+    s = gid % cap
+    if r >= R:
+        return
+    key = ht_key[r * cap + s]
+    if key < wp.int64(0):
+        return
+    src = key / n1
+    dst = key - src * n1
+    gkey = (wp.int64(r) * n1 + src) * n1 + dst
+    pos = wp.atomic_add(cursor, 0, 1)
+    out_keys[pos] = gkey
+    out_data[pos] = ht_count[r * cap + s]
+
+
+@wp.kernel
+def neighbor_csr_count_global_kernel(
+    keys: wp.array(dtype=wp.int64),        # global keys (any order) (r*n1+src)*n1+dst
+    n: wp.int32,
+    n1: wp.int64,
+    row_counts: wp.array(dtype=wp.int32),  # (R*n1+1,) per global-row (r*n1+src) degree
+):
+    """One thread per contact: bump the degree of its global row ``r*n1 + src`` =
+    ``key / n1``. Feeds the global exclusive scan -> the batched CSR indptr."""
+    i = wp.tid()
+    if i >= n:
+        return
+    row = wp.int32(keys[i] / n1)
+    wp.atomic_add(row_counts, row, 1)
+
+
+@wp.kernel
+def neighbor_csr_extract_dst_global_kernel(
+    keys: wp.array(dtype=wp.int64),        # radix-sorted global keys (r*n1+src)*n1+dst
+    n: wp.int32,
+    n1: wp.int64,
+    out_dst: wp.array(dtype=wp.int32),     # dst id per contact (global CSR indices)
+):
+    """One thread per contact: dst = key % n1 (int32). The global indices array for the
+    batched CSR (replica r's block is contiguous because the sort grouped by r)."""
+    i = wp.tid()
+    if i >= n:
+        return
+    out_dst[i] = wp.int32(keys[i] % n1)
 
 
 # Within-row ascending order is obtained by a single GLOBAL wp.utils.radix_sort_pairs

@@ -293,6 +293,7 @@ class BatchedLamellipodiaSteppable:
                  leading_type: int = 1, substrate_type: int = 4, passive_type: int = 2,
                  params: EmbryoParams = DEFAULT, delete_rate=None, owns_topology: bool = True):
         from engine import cohesotaxis as CT
+        from engine.cohesotaxis_fused import FusedCohesotaxisPipeline
         self._CT = CT
         self.engine = engine
         self.links = links
@@ -302,7 +303,11 @@ class BatchedLamellipodiaSteppable:
         self.owns_topology = bool(owns_topology)
         ld = params.lamellipodia_distance
         self.views = [_ReplicaEngineView(engine, r) for r in range(self.R)]
-        self.pipes = [CT.CohesotaxisPipeline(
+        # Phase 8: per-replica FUSED (canonical-order, deterministic) cohesotaxis
+        # pipeline -> the lamellipodia selection is bit-reproducible, so a batched run
+        # equals R single runs bit-identically. The views alias the live batched device
+        # slices, so each pipe reads its replica's current lattice/COM.
+        self.pipes = [FusedCohesotaxisPipeline(
             self.views[r], leading_type=leading_type, substrate_type=substrate_type,
             passive_type=passive_type, lamellipodia_distance=ld, sigma=params.sigma)
             for r in range(self.R)]

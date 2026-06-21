@@ -71,6 +71,8 @@ class BatchedFPPLinks:
         self._pa = self._pb = None
         self._plam = self._ptgt = self._pmax = None
         self._keep = self._degree = self._cursor = None
+        self._device_topology = False     # Phase 8: True when fed device arrays directly
+        self._M_dev = 0
 
     # ----------------------------------------------------------- topology setup
     def _broadcast(self, v, default, m):
@@ -101,6 +103,7 @@ class BatchedFPPLinks:
         self._tgt = self._broadcast(targets, self.target_default, m)
         self._max = self._broadcast(maxlens, self.max_default, m)
         self._dev_dirty = True
+        self._device_topology = False
 
     def set_per_replica_pairs(self, pairs_list, lambdas=None, targets=None, maxlens=None):
         """Replace the topology with a DIFFERENT undirected network per replica (Tier 2
@@ -130,13 +133,44 @@ class BatchedFPPLinks:
                 mx[r, :m] = np.asarray(maxlens[r], dtype=np.float32).reshape(-1)
         self._a, self._b, self._lam, self._tgt, self._max = a, b, lam, tgt, mx
         self._dev_dirty = True
+        self._device_topology = False
+
+    def _set_device_topology(self, a_dev, b_dev, lam_dev, tgt_dev, max_dev, M: int):
+        """Set the per-replica padded (R, M) topology DIRECTLY from device arrays (flat
+        R*M, replica-major) -- the Phase-8 device-combine seam. Skips the host round-trip
+        ``_sync_device_topology`` does (it copies host ``_a`` up); instead the combined
+        device arrays ARE the topology. Allocates the CSR scratch + payload sized to M."""
+        R = self.R
+        self._pa = a_dev
+        self._pb = b_dev
+        self._plam = lam_dev
+        self._ptgt = tgt_dev
+        self._pmax = max_dev
+        self._M_dev = int(M)
+        self._keep = wp.zeros(max(1, R * M), dtype=wp.int32, device=self.device)
+        self._degree = wp.zeros(R * (self.n1 + 1), dtype=wp.int32, device=self.device)
+        self._cursor = wp.zeros(R * (self.n1 + 1), dtype=wp.int32, device=self.device)
+        self.link_pay_stride = 2 * M
+        n_pay = max(1, R * self.link_pay_stride)
+        self.link_other = wp.zeros(n_pay, dtype=wp.int32, device=self.device)
+        self.link_lambda = wp.zeros(n_pay, dtype=wp.float32, device=self.device)
+        self.link_target = wp.zeros(n_pay, dtype=wp.float32, device=self.device)
+        # mark host arrays as a known-width placeholder so n_pairs/has_links work; the
+        # actual topology lives on device now. (No host copy of the device arrays.)
+        self._a = np.full((R, M), -1, dtype=np.int32)  # width marker only
+        self._dev_dirty = False
+        self._device_topology = True
 
     @property
     def n_pairs(self) -> int:
         """Padded per-replica topology width M (slots, including tombstones)."""
+        if getattr(self, "_device_topology", False):
+            return int(self._M_dev)
         return int(self._a.shape[1])
 
     def has_links(self) -> bool:
+        if getattr(self, "_device_topology", False):
+            return self._M_dev > 0      # combined device topology has live links if M>0
         return self.n_pairs > 0 and bool((self._a >= 0).any())
 
     # --------------------------------------------------------------- device sync

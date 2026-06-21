@@ -90,9 +90,10 @@ class GraphRunner:
             return (1, e.fpp.link_ptr, e.fpp.link_other, e.fpp.link_lambda, e.fpp.link_target)
         return (0, e._fpp_dummy_i32, e._fpp_dummy_i32, e._fpp_dummy_f32, e._fpp_dummy_f32)
 
-    def _launch_color(self, color: int, fpp):
+    def _launch_color(self, color: int, fpp, snap):
         e = self.engine
         fpp_enabled, link_ptr, link_other, link_lambda, link_target = fpp
+        snap_x, snap_y, snap_z, snap_v = snap
         wp.launch(
             K.metropolis_color_dev_mcs_kernel,
             dim=e._color_threads,
@@ -106,13 +107,35 @@ class GraphRunner:
                 e.Lx, e.Ly, e.Lz,
                 color, self.mcs_dev, e.base_seed, e.T,
                 fpp_enabled, link_ptr, link_other, link_lambda, link_target,
+                snap_x, snap_y, snap_z, snap_v,
             ],
             device=self.device,
         )
 
-    def _record(self, fpp):
+    def _snap_args(self, fpp_enabled):
+        """Per-sweep COM/volume snapshot buffers (Phase 8). When FPP + the snapshot
+        are on, allocate persistent buffers the captured graph copies into at the start
+        of each MCS (a device->device ``wp.copy`` is captureable); otherwise alias the
+        live arrays (byte-identical to the prior path)."""
+        e = self.engine
+        if fpp_enabled == 0 or not getattr(e, "fpp_com_snapshot", True):
+            return (e.xsum, e.ysum, e.zsum, e.volume), False
+        n1 = e.n_cells + 1
+        if e._fpp_snap_xsum is None:
+            e._fpp_snap_xsum = wp.zeros(n1, dtype=wp.int64, device=self.device)
+            e._fpp_snap_ysum = wp.zeros(n1, dtype=wp.int64, device=self.device)
+            e._fpp_snap_zsum = wp.zeros(n1, dtype=wp.int64, device=self.device)
+            e._fpp_snap_volume = wp.zeros(n1, dtype=wp.float32, device=self.device)
+        return (e._fpp_snap_xsum, e._fpp_snap_ysum,
+                e._fpp_snap_zsum, e._fpp_snap_volume), True
+
+    def _record(self, fpp, snap, snap_active):
+        e = self.engine
+        if snap_active:  # re-snapshot the live COM at the start of each replayed MCS
+            wp.copy(snap[0], e.xsum); wp.copy(snap[1], e.ysum)
+            wp.copy(snap[2], e.zsum); wp.copy(snap[3], e.volume)
         for color in self.engine.colors:
-            self._launch_color(color, fpp)
+            self._launch_color(color, fpp, snap)
         wp.launch(K.incr_mcs_kernel, dim=1, inputs=[self.mcs_dev], device=self.device)
 
     def capture(self, mcs_offset: int = 0):
@@ -127,10 +150,11 @@ class GraphRunner:
         ``mcs_dev`` is set so the first replay runs ``mcs_offset``.
         """
         fpp = self._fpp_args()        # FPP rebuild = host compaction, BEFORE capture
+        snap, snap_active = self._snap_args(fpp[0])
         wp.force_load(self.device)    # compile kernels now (not mid-capture)
         self.mcs_dev.fill_(wp.int32(mcs_offset))
         with wp.ScopedCapture(device=self.device, force_module_load=True) as cap:
-            self._record(fpp)
+            self._record(fpp, snap, snap_active)
         self.graph = cap.graph
         self._captured_fpp_enabled = fpp[0]
         return self.graph

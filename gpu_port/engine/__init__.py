@@ -34,10 +34,12 @@ from .cpu_reference import CPUReference
 from .fpp import FPPLinks, grid_graph_links
 from .batched_fpp import BatchedFPPLinks
 from .graph import GraphRunner, BatchedGraphRunner
+from .cohesotaxis_fused import FusedCohesotaxisPipeline, BatchedFusedCohesotaxisPipeline
 from . import geometry
 from . import steppables
 from . import fpp
 from . import cohesotaxis
+from . import cohesotaxis_fused
 from . import graph
 from . import bench
 
@@ -61,6 +63,8 @@ __all__ = [
     "CPUReference",
     "FPPLinks",
     "BatchedFPPLinks",
+    "FusedCohesotaxisPipeline",
+    "BatchedFusedCohesotaxisPipeline",
     "grid_graph_links",
     "GraphRunner",
     "BatchedGraphRunner",

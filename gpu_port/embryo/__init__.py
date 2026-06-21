@@ -36,6 +36,7 @@ SKIPPED (documented, no physics): ``EmbryoSteppable.step`` (TIFF I/O only),
 from .params import EmbryoParams
 from .steppables import TissueLinkSteppable, PassiveSubstrateSteppable, ClosureSteppable
 from .model import EmbryoModel, build_closure_scene, build_scaled_embryo
+from .batched_device import BatchedDeviceEmbryoModel
 
 __all__ = [
     "EmbryoParams",
@@ -45,4 +46,5 @@ __all__ = [
     "EmbryoModel",
     "build_closure_scene",
     "build_scaled_embryo",
+    "BatchedDeviceEmbryoModel",
 ]

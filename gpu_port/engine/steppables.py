@@ -181,7 +181,7 @@ class LamellipodiaSteppable(GPUSteppable):
     def __init__(self, engine: GPUEngine, links, leading_type: int,
                  substrate_type: int, passive_type: int,
                  lamellipodia_distance: int | None = None, frequency: int = 1,
-                 link_backend: str = "host"):
+                 link_backend: str = "host", cohesotaxis_backend: str = "fused"):
         super().__init__(engine, frequency)
         from . import cohesotaxis as CT
         self._CT = CT
@@ -189,10 +189,21 @@ class LamellipodiaSteppable(GPUSteppable):
         self.leading_type = int(leading_type)
         self.substrate_type = int(substrate_type)
         self.link_backend = link_backend  # "device" (no copyback) or "host" (tests)
+        # cohesotaxis_backend: "fused" (Phase-8 single persistent-buffer device pipeline
+        # -- canonical-order, deterministic, no inter-stage host glue; the hot path) or
+        # "staged" (the Phase-3 staged pipeline, kept reachable for the differential
+        # test). Both are deterministic; "staged" uses canonical order to match "fused".
+        self.cohesotaxis_backend = cohesotaxis_backend
         ld = CT.LAMELLIPODIA_DISTANCE if lamellipodia_distance is None else lamellipodia_distance
-        self.pipe = CT.CohesotaxisPipeline(
-            engine, leading_type=leading_type, substrate_type=substrate_type,
-            passive_type=passive_type, lamellipodia_distance=ld)
+        if cohesotaxis_backend == "fused":
+            from .cohesotaxis_fused import FusedCohesotaxisPipeline
+            self.pipe = FusedCohesotaxisPipeline(
+                engine, leading_type=leading_type, substrate_type=substrate_type,
+                passive_type=passive_type, lamellipodia_distance=ld)
+        else:
+            self.pipe = CT.CohesotaxisPipeline(
+                engine, leading_type=leading_type, substrate_type=substrate_type,
+                passive_type=passive_type, lamellipodia_distance=ld, canonical=True)
         # cell.dict['link'] equivalent: substrate id each leader is linked to (0=none)
         # (HOST path only; the device path derives 'has a link' from the inventory)
         self.cell_dict.register("link_target", "int32", 0)

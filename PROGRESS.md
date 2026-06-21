@@ -460,3 +460,32 @@ only; pre-existing FPP COM-read race). **LEFT FOR PHASE 8**: residual ~4 ms step
 cohesotaxis-CREATE pipeline (host per-cell prefix-sum SigWeights) still host-side; the batched R-replica loops still
 host-side; the FPP COM-read race remains an open item (do NOT assume bit-exact `EmbryoModel.run` replay). NEXT:
 `plan_docs/phase_08_cohesotaxis_fusion_batched_collapse.md`.
+
+## Phase 8 — cohesotaxis pipeline fusion + batched R-loop collapse — DONE (complete) 2026-06-21
+
+Orchestrated per `.claude/workflow.md` (executor=Opus, summarizer=Sonnet). Final phase of the host→device plan.
+Verdict: complete / minor / no-escalate. **Committed after user sign-off** at the mandatory circuit-breaker check-in
+(see flaky-gate note below). Delivered both objectives: (1) **fused single-engine cohesotaxis** —
+`gpu_port/engine/cohesotaxis_fused.py` `FusedCohesotaxisPipeline` collapses the 5 staged kernels + host glue into one
+persistent-buffer device pipeline (device SigWeights, canonical-order key-sort fill for deterministic pixel ordering,
+fused select+Gumbel+Manhattan); only the final `{cell→target}` leaves the device; staged path kept behind
+`cohesotaxis_backend="fused"|"staged"`; fused==staged bit-exact per `(mcs,cell,seed)`. (2) **batched R-loop collapse** —
+keyed GLOBAL radix sort (replica id packed into the int64 `(src,dst)` key high bits → disjoint per-replica ranges) +
+segmented scan replaces the per-replica CSR loop; batched tissue/substrate kernels along R (`batched_link_kernels.py`,
+`dim=R` serial-per-replica for the load-bearing cap order); device combine/gather for padded (R,M); replica-segmented
+cohesotaxis; driver `gpu_port/embryo/batched_device.py` `BatchedDeviceEmbryoModel(fast=True)`. **THROUGHPUT (device-
+collapsed vs O(R)-host)**: R=8 5.3× (~1235 rep-MCS/s), R=32 12.7× (~2994), R=64 17.8× (~4042) → large-R sweeps are now
+GPU-bound. **LANDMINE → Option 1 (COM/volume snapshot)**: new `fpp_com_snapshot=True` flag freezes COM/volume into a
+pre-sweep snapshot that the 3 FPP Metropolis kernels read (Volume+Contact still read LIVE arrays → byte-unchanged),
+removing the FPP COM read-during-write race. Result: **`EmbryoModel.run` is now BIT-REPRODUCIBLE** (closes the
+long-standing FPP bit-repro open item) and per-replica bit-exact FPP is achievable. Flag-gated (off = prior racy path).
+Statistically fidelity-neutral (Volume+Contact byte-identical; FPP/cohesotaxis stats within Phase-3 tolerances). Skeptical
+summarizer review CONFIRMED: zero prior test files modified, new bit-exact tests genuine (not tautological), COM-snapshot
+flag-gated + Volume+Contact-neutral. New flags: `fpp_com_snapshot`, `cohesotaxis_backend`, batched `fast`. Tests: 218
+passed / 4 skip (3 sanctioned + 1 new opt-in BENCH throughput sweep). **FLAKY-GATE NOTE**: when the summarizer subagent
+stopped, the gate hook re-ran the suite and reported tests failing — NON-REPRODUCIBLE: I re-ran the full suite 3× green
+(178s/130s + executor's) and looped the suspect bit-exact tests (phase-8 `test_batched_collapse.py` + phase-4 batched)
+8/8 green. Flake is low-rate, NOT in phase-8 deliverables (likely transient GPU contention under heavy load, or rare
+pre-existing nondeterminism). User accepted after review. **FOLLOW-UPS**: batched-gather to replace the R-serial
+device->device copies in `build_csr_and_attach` (O(R) launches at large R); int64 lattice indexing; offline CC3D ensemble
+validation; hunt/harden the low-rate suite flake. HOST→DEVICE PLAN (phases 6-8) COMPLETE.

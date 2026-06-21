@@ -455,7 +455,7 @@ class CohesotaxisPipeline:
 
     def __init__(self, engine: GPUEngine, leading_type: int, substrate_type: int,
                  passive_type: int, lamellipodia_distance: int = LAMELLIPODIA_DISTANCE,
-                 sigma: float = SIGMA):
+                 sigma: float = SIGMA, canonical: bool = False):
         self.engine = engine
         self.device = engine.device
         self.leading_type = int(leading_type)
@@ -463,6 +463,12 @@ class CohesotaxisPipeline:
         self.passive_type = int(passive_type)
         self.lam_dist = int(lamellipodia_distance)
         self.sigma = float(sigma)
+        # canonical: sort each slot's free/adhesion pixels by ascending global voxel
+        # index after the atomic-append fill (so PixelDist's float sum + the rank
+        # tiebreak are deterministic -- the staged path's atomic-fill order was the
+        # FPP non-reproducibility source). Phase 8 turns this on for the deterministic
+        # differential test against the fused pipeline; default off = the Phase-3 path.
+        self.canonical = bool(canonical)
 
         self.Lx, self.Ly, self.Lz = engine.Lx, engine.Ly, engine.Lz
         self.n1 = engine.n_cells + 1
@@ -553,6 +559,31 @@ class CohesotaxisPipeline:
         for s in range(self.n_slots):
             fslot[free_ptr[s]:free_ptr[s + 1]] = s
         res.free_slot = fslot
+
+        if self.canonical:
+            # reorder each slot's pixels by ascending global voxel index (stable total
+            # order) so PixelDist's float sum + the rank tiebreak are deterministic.
+            def _canon(xyz, ptr):
+                if xyz.shape[0] == 0:
+                    return xyz
+                vi = (xyz[:, 2].astype(np.int64) * self.Ly + xyz[:, 1]) * self.Lx + xyz[:, 0]
+                order = np.arange(xyz.shape[0])
+                for s in range(self.n_slots):
+                    lo, hi = int(ptr[s]), int(ptr[s + 1])
+                    if hi > lo:
+                        seg = np.argsort(vi[lo:hi], kind="stable")
+                        order[lo:hi] = lo + seg
+                return xyz[order]
+            res.free_xyz = _canon(res.free_xyz, free_ptr)
+            res.adh_xyz = _canon(res.adh_xyz, adh_ptr)
+            if n_free:
+                fX = wp.array(res.free_xyz[:, 0].copy(), dtype=wp.int32, device=self.device)
+                fY = wp.array(res.free_xyz[:, 1].copy(), dtype=wp.int32, device=self.device)
+                fZ = wp.array(res.free_xyz[:, 2].copy(), dtype=wp.int32, device=self.device)
+            if n_adh:
+                aX = wp.array(res.adh_xyz[:, 0].copy(), dtype=wp.int32, device=self.device)
+                aY = wp.array(res.adh_xyz[:, 1].copy(), dtype=wp.int32, device=self.device)
+                aZ = wp.array(res.adh_xyz[:, 2].copy(), dtype=wp.int32, device=self.device)
 
         # cache device buffers for later stages
         self._d_free_ptr = d_free_ptr

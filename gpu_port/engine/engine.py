@@ -36,9 +36,24 @@ wp.init()
 
 
 class GPUEngine:
-    def __init__(self, state: EngineState, device: str = "cuda:0"):
+    def __init__(self, state: EngineState, device: str = "cuda:0",
+                 fpp_com_snapshot: bool = True):
         self.cfg: EngineConfig = state.cfg
         self.device = device
+        # Phase 8: snapshot xsum/ysum/zsum/volume into frozen per-sweep buffers that
+        # the FPP spring term reads, so the spring length is a pure function of the
+        # pre-sweep COMs + the proposed flip -> the FPP-driven trajectory is
+        # BIT-REPRODUCIBLE (it no longer reads a COM accumulator a concurrent
+        # same-color flip is mid-updating). Fidelity-neutral: the COM moves at most
+        # ~O(1/volume) voxels within one sweep, far below the FPP statistical gate.
+        # The Volume/Contact deltas are UNCHANGED (still read the live arrays), so
+        # Volume+Contact runs stay byte-identical. Set False to read live COMs (the
+        # prior racy path) for the differential bit-exact-vs-staged test.
+        self.fpp_com_snapshot = bool(fpp_com_snapshot)
+        self._fpp_snap_xsum = None
+        self._fpp_snap_ysum = None
+        self._fpp_snap_zsum = None
+        self._fpp_snap_volume = None
         self.Lx, self.Ly, self.Lz = self.cfg.Lx, self.cfg.Ly, self.cfg.Lz
         self.n_cells = state.n_cells
         n1 = self.n_cells + 1
@@ -123,6 +138,28 @@ class GPUEngine:
         fpp.rebuild()
         return fpp
 
+    # ----------------------------------------------------------- FPP COM snapshot
+    def _refresh_fpp_snapshot(self):
+        """Copy the live COM/volume into the per-sweep FPP snapshot buffers and return
+        them (Phase 8). Links are static within a sweep, so this single pre-sweep copy
+        is the consistent COM the spring reads across all 8 colors -> deterministic
+        spring energy. If ``fpp_com_snapshot`` is off, return the LIVE arrays (alias)
+        so the kernel is byte-identical to the prior (racy) read path."""
+        if not self.fpp_com_snapshot:
+            return self.xsum, self.ysum, self.zsum, self.volume
+        n1 = self.n_cells + 1
+        if self._fpp_snap_xsum is None:
+            self._fpp_snap_xsum = wp.zeros(n1, dtype=wp.int64, device=self.device)
+            self._fpp_snap_ysum = wp.zeros(n1, dtype=wp.int64, device=self.device)
+            self._fpp_snap_zsum = wp.zeros(n1, dtype=wp.int64, device=self.device)
+            self._fpp_snap_volume = wp.zeros(n1, dtype=wp.float32, device=self.device)
+        wp.copy(self._fpp_snap_xsum, self.xsum)
+        wp.copy(self._fpp_snap_ysum, self.ysum)
+        wp.copy(self._fpp_snap_zsum, self.zsum)
+        wp.copy(self._fpp_snap_volume, self.volume)
+        return (self._fpp_snap_xsum, self._fpp_snap_ysum,
+                self._fpp_snap_zsum, self._fpp_snap_volume)
+
     # ------------------------------------------------------------------ sweep
     def step_mcs(self, mcs: int):
         """One Monte Carlo step: 8 color launches (one full lattice sweep).
@@ -139,12 +176,17 @@ class GPUEngine:
             link_other = self.fpp.link_other
             link_lambda = self.fpp.link_lambda
             link_target = self.fpp.link_target
+            # snapshot the COM/volume the spring reads (frozen for the whole sweep);
+            # when disabled, alias the live arrays (byte-identical to the prior path).
+            snap_x, snap_y, snap_z, snap_v = self._refresh_fpp_snapshot()
         else:
             fpp_enabled = 0
             link_ptr = self._fpp_dummy_i32
             link_other = self._fpp_dummy_i32
             link_lambda = self._fpp_dummy_f32
             link_target = self._fpp_dummy_f32
+            snap_x, snap_y, snap_z, snap_v = (
+                self.xsum, self.ysum, self.zsum, self.volume)
 
         for color in self.colors:
             wp.launch(
@@ -160,6 +202,7 @@ class GPUEngine:
                     self.Lx, self.Ly, self.Lz,
                     color, mcs, self.base_seed, self.T,
                     fpp_enabled, link_ptr, link_other, link_lambda, link_target,
+                    snap_x, snap_y, snap_z, snap_v,
                 ],
                 device=self.device,
             )
