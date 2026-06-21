@@ -102,6 +102,7 @@ class GPUEngine:
         self._csr_cursor = None       # per-row append cursor (n1+1 int32)
         self._csr_keys = None         # dense packed keys src*n1+dst (>= 2*n_contacts int64)
         self._csr_data = None         # dense CSR counts  (>= 2*n_contacts int32)
+        self._csr_indices = None      # extracted dst ids (>= n_contacts int32)
 
     # ---------------------------------------------------------------- FPP attach
     def attach_fpp(self, fpp):
@@ -350,11 +351,22 @@ class GPUEngine:
         # one global radix sort of the int64 packed key (co-moving the counts): groups
         # by src and orders dst ascending within each row in a single O(#contacts) pass.
         wp.utils.radix_sort_pairs(self._csr_keys, self._csr_data, n_contacts)
+
+        # extract dst (= key % n1) to a compact int32 array ON DEVICE, then copy back
+        # only the n_contacts slice of int32 indices + counts. Copying the int64 keys'
+        # full double-buffer + a host modulo was the CSR build's dominant cost.
+        if self._csr_indices is None or self._csr_indices.shape[0] < n_contacts:
+            self._csr_indices = wp.zeros(n_contacts, dtype=wp.int32, device=self.device)
+        wp.launch(
+            K.neighbor_csr_extract_dst_kernel,
+            dim=n_contacts,
+            inputs=[self._csr_keys, n_contacts, wp.int64(n1), self._csr_indices],
+            device=self.device,
+        )
         wp.synchronize()
 
-        keys = self._csr_keys.numpy()[:n_contacts]
-        indices = (keys % np.int64(n1)).astype(np.int64)   # dst id (Medium 0 included)
-        data = self._csr_data.numpy()[:n_contacts].astype(np.int64)
+        indices = self._csr_indices.numpy().astype(np.int64)               # Medium 0 included
+        data = self._csr_data[:n_contacts].numpy().astype(np.int64)        # slice off the 2x buffer
         return indptr, indices, data
 
     # ------------------------------------------------------ tracker maintenance

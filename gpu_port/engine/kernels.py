@@ -1192,6 +1192,22 @@ def neighbor_csr_compact_kernel(
     out_data[pos] = ht_count[i]
 
 
+@wp.kernel
+def neighbor_csr_extract_dst_kernel(
+    keys: wp.array(dtype=wp.int64),        # radix-sorted packed keys src*n1+dst
+    n: wp.int32,
+    n_cells_p1: wp.int64,
+    out_dst: wp.array(dtype=wp.int32),     # dst id per contact (CSR indices)
+):
+    """One thread per contact: dst = key % n1, as int32. Lets the host copy back a
+    compact int32 indices array instead of the int64 keys (half the PCIe volume, no
+    host-side modulo over the whole double-buffer -- copyback was the CSR hotspot)."""
+    i = wp.tid()
+    if i >= n:
+        return
+    out_dst[i] = wp.int32(keys[i] % n_cells_p1)
+
+
 # Within-row ascending order is obtained by a single GLOBAL wp.utils.radix_sort_pairs
 # on the int64 packed key src*n1+dst (see GPUEngine._compact_csr_device): ascending
 # key == ascending (src, dst) since dst < n1, so one O(#contacts) sort yields the CSR
