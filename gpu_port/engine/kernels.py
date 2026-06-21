@@ -277,6 +277,161 @@ def metropolis_color_kernel(
 
 
 # ---------------------------------------------------------------------------
+# CUDA-Graph capture support (Phase 4 Pass B)
+#
+# A captured CUDA graph BAKES every *scalar* kernel argument in at capture time,
+# so a graph recorded with a literal ``mcs`` would replay that SAME ``mcs`` (and
+# thus the SAME Philox key ``base_seed + mcs*131072 + color*16384``) on every
+# replay -- physically wrong (each MCS must draw a fresh RNG stream). To replay a
+# SINGLE captured graph across many MCS, the step index must live in DEVICE memory
+# and advance on-device between replays.
+#
+# ``metropolis_color_dev_mcs_kernel`` is a mechanical copy of
+# ``metropolis_color_kernel`` differing in EXACTLY one line: ``mcs`` is read from
+# ``mcs_dev[0]`` (a 1-element device array) instead of a baked-in scalar. Every
+# other line -- the RNG key, the flip mechanic, the Volume/Contact/FPP deltas, the
+# Metropolis test, and the int64 atomic COM apply -- is byte-identical, so a
+# graph-captured run is BIT-EXACT to the eager ``metropolis_color_kernel`` run with
+# the same seed (asserted by the Pass B graph==eager test, which guards this copy
+# against any divergence). ``incr_mcs_kernel`` does the on-device ``mcs_dev[0] += 1``
+# captured at the end of each MCS so replaying the graph N times walks mcs = m0,
+# m0+1, ..., m0+N-1 exactly as the eager host loop does.
+# ---------------------------------------------------------------------------
+@wp.kernel
+def incr_mcs_kernel(mcs_dev: wp.array(dtype=wp.int32)):
+    # single-thread on-device increment of the per-MCS step counter; captured as
+    # the last node of the per-MCS graph so each replay advances the RNG key.
+    if wp.tid() == 0:
+        mcs_dev[0] = mcs_dev[0] + 1
+
+
+@wp.kernel
+def metropolis_color_dev_mcs_kernel(
+    ids: wp.array(dtype=wp.int32),
+    cell_type: wp.array(dtype=wp.int32),
+    volume: wp.array(dtype=wp.float32),
+    xsum: wp.array(dtype=wp.int64),
+    ysum: wp.array(dtype=wp.int64),
+    zsum: wp.array(dtype=wp.int64),
+    target_volume: wp.array(dtype=wp.float32),     # per-cell
+    lambda_volume: wp.array(dtype=wp.float32),     # per-cell
+    contact: wp.array(dtype=wp.float32, ndim=2),   # (n_types,n_types)
+    type_frozen: wp.array(dtype=wp.int32),         # (n_types,) 1 if frozen
+    contact_off: wp.array(dtype=wp.int32),         # flat 3*Nc contact-shell offsets
+    n_contact: wp.int32,
+    flip_off: wp.array(dtype=wp.int32),            # flat 3*Nf flip-target offsets
+    n_flip: wp.int32,
+    Lx: wp.int32, Ly: wp.int32, Lz: wp.int32,
+    color: wp.int32,
+    mcs_dev: wp.array(dtype=wp.int32),             # <-- device-resident mcs (vs scalar)
+    base_seed: wp.int32,
+    temperature: wp.float32,
+    fpp_enabled: wp.int32,
+    link_ptr: wp.array(dtype=wp.int32),
+    link_other: wp.array(dtype=wp.int32),
+    link_lambda: wp.array(dtype=wp.float32),
+    link_target: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+
+    cx = color & 1
+    cy = (color >> 1) & 1
+    cz = (color >> 2) & 1
+    nx = (Lx - cx + 1) / 2
+    ny = (Ly - cy + 1) / 2
+    nz = (Lz - cz + 1) / 2
+    total = nx * ny * nz
+    if tid >= total:
+        return
+    ix = tid % nx
+    rem = tid / nx
+    iy = rem % ny
+    iz = rem / ny
+    x = cx + 2 * ix
+    y = cy + 2 * iy
+    z = cz + 2 * iz
+
+    target_idx = lin_idx(x, y, z, Lx, Ly)
+    old_id = ids[target_idx]
+    old_t = cell_type[old_id]
+
+    if old_id != 0 and type_frozen[old_t] == 1:
+        return
+
+    # ---- RNG: stateless Philox keyed by (mcs, color, base_seed); mcs from device
+    mcs = mcs_dev[0]
+    seed = base_seed + mcs * 131072 + color * 16384
+    state = wp.rand_init(seed, target_idx)
+
+    k = wp.randi(state, 0, n_flip)
+    sx = x + flip_off[3 * k + 0]
+    sy = y + flip_off[3 * k + 1]
+    sz = z + flip_off[3 * k + 2]
+    if not in_bounds(sx, sy, sz, Lx, Ly, Lz):
+        return
+    new_id = ids[lin_idx(sx, sy, sz, Lx, Ly)]
+    if new_id == old_id:
+        return
+    new_t = cell_type[new_id]
+    if new_id != 0 and type_frozen[new_t] == 1:
+        return
+
+    de = float(0.0)
+    if new_id != 0:
+        de += lambda_volume[new_id] * (1.0 + 2.0 * (volume[new_id] - target_volume[new_id]))
+    if old_id != 0:
+        de += lambda_volume[old_id] * (1.0 - 2.0 * (volume[old_id] - target_volume[old_id]))
+
+    for n in range(n_contact):
+        nnx = x + contact_off[3 * n + 0]
+        nny = y + contact_off[3 * n + 1]
+        nnz = z + contact_off[3 * n + 2]
+        ncell = get_id(ids, nnx, nny, nnz, Lx, Ly, Lz)
+        nt = cell_type[ncell]
+        if ncell != old_id:
+            de -= contact[old_t, nt]
+        if ncell != new_id:
+            de += contact[new_t, nt]
+
+    if fpp_enabled != 0:
+        fpx = wp.float32(x)
+        fpy = wp.float32(y)
+        fpz = wp.float32(z)
+        de += fpp_delta_cell(
+            new_id, 1.0, fpx, fpy, fpz,
+            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+        )
+        de += fpp_delta_cell(
+            old_id, -1.0, -fpx, -fpy, -fpz,
+            xsum, ysum, zsum, volume, link_ptr, link_other, link_lambda, link_target,
+        )
+
+    accept = False
+    if de <= 0.0:
+        accept = True
+    else:
+        if wp.randf(state) < wp.exp(-de / temperature):
+            accept = True
+    if not accept:
+        return
+
+    ids[target_idx] = new_id
+    fx = wp.int64(x)
+    fy = wp.int64(y)
+    fz = wp.int64(z)
+    if old_id != 0:
+        wp.atomic_add(volume, old_id, -1.0)
+        wp.atomic_add(xsum, old_id, -fx)
+        wp.atomic_add(ysum, old_id, -fy)
+        wp.atomic_add(zsum, old_id, -fz)
+    if new_id != 0:
+        wp.atomic_add(volume, new_id, 1.0)
+        wp.atomic_add(xsum, new_id, fx)
+        wp.atomic_add(ysum, new_id, fy)
+        wp.atomic_add(zsum, new_id, fz)
+
+
+# ---------------------------------------------------------------------------
 # BATCHED Metropolis (Phase 4 Pass A) -- R independent replicas, one launch.
 #
 # Layout (documented, coalescing-preserving): the replica axis is the SLOWEST
@@ -439,6 +594,139 @@ def metropolis_color_batched_kernel(
         return
 
     # ---- apply: lattice write + atomic SoA updates (replica-local slice) ----
+    ids[target_idx] = new_id
+    fx = wp.int64(x)
+    fy = wp.int64(y)
+    fz = wp.int64(z)
+    if old_id != 0:
+        wp.atomic_add(volume, cell_base + old_id, -1.0)
+        wp.atomic_add(xsum, cell_base + old_id, -fx)
+        wp.atomic_add(ysum, cell_base + old_id, -fy)
+        wp.atomic_add(zsum, cell_base + old_id, -fz)
+    if new_id != 0:
+        wp.atomic_add(volume, cell_base + new_id, 1.0)
+        wp.atomic_add(xsum, cell_base + new_id, fx)
+        wp.atomic_add(ysum, cell_base + new_id, fy)
+        wp.atomic_add(zsum, cell_base + new_id, fz)
+
+
+# ---------------------------------------------------------------------------
+# BATCHED device-mcs Metropolis (Phase 4 Pass B): mechanical copy of
+# ``metropolis_color_batched_kernel`` differing ONLY in reading ``mcs`` from
+# ``mcs_dev[0]`` (device-resident) so one captured CUDA graph replays across many
+# MCS with a correctly-advancing per-replica Philox key. Byte-identical otherwise
+# (bit-exact to the eager batched kernel; the Pass B graph==eager test guards it).
+# ---------------------------------------------------------------------------
+@wp.kernel
+def metropolis_color_batched_dev_mcs_kernel(
+    ids: wp.array(dtype=wp.int32),
+    cell_type: wp.array(dtype=wp.int32),
+    cell_type_r: wp.int32,
+    volume: wp.array(dtype=wp.float32),
+    xsum: wp.array(dtype=wp.int64),
+    ysum: wp.array(dtype=wp.int64),
+    zsum: wp.array(dtype=wp.int64),
+    target_volume: wp.array(dtype=wp.float32),
+    lambda_volume: wp.array(dtype=wp.float32),
+    contact: wp.array(dtype=wp.float32),
+    n_types: wp.int32,
+    type_frozen: wp.array(dtype=wp.int32),
+    contact_off: wp.array(dtype=wp.int32),
+    n_contact: wp.int32,
+    flip_off: wp.array(dtype=wp.int32),
+    n_flip: wp.int32,
+    Lx: wp.int32, Ly: wp.int32, Lz: wp.int32,
+    nvox: wp.int32,
+    n1: wp.int32,
+    R: wp.int32,
+    color_threads: wp.int32,
+    color: wp.int32,
+    mcs_dev: wp.array(dtype=wp.int32),             # <-- device-resident mcs (vs scalar)
+    base_seed_r: wp.array(dtype=wp.int32),
+    temperature: wp.array(dtype=wp.float32),
+):
+    gid = wp.tid()
+    r = gid / color_threads
+    tid = gid % color_threads
+    if r >= R:
+        return
+
+    cx = color & 1
+    cy = (color >> 1) & 1
+    cz = (color >> 2) & 1
+    nx = (Lx - cx + 1) / 2
+    ny = (Ly - cy + 1) / 2
+    nz = (Lz - cz + 1) / 2
+    total = nx * ny * nz
+    if tid >= total:
+        return
+    ix = tid % nx
+    rem = tid / nx
+    iy = rem % ny
+    iz = rem / ny
+    x = cx + 2 * ix
+    y = cy + 2 * iy
+    z = cz + 2 * iz
+
+    vox_base = r * nvox
+    cell_base = r * n1
+    ct_base = cell_type_r * cell_base
+
+    local_idx = lin_idx(x, y, z, Lx, Ly)
+    target_idx = vox_base + local_idx
+    old_id = ids[target_idx]
+    old_t = cell_type[ct_base + old_id]
+
+    if old_id != 0 and type_frozen[old_t] == 1:
+        return
+
+    mcs = mcs_dev[0]
+    seed = base_seed_r[r] + mcs * 131072 + color * 16384
+    state = wp.rand_init(seed, local_idx)
+
+    k = wp.randi(state, 0, n_flip)
+    sx = x + flip_off[3 * k + 0]
+    sy = y + flip_off[3 * k + 1]
+    sz = z + flip_off[3 * k + 2]
+    if not in_bounds(sx, sy, sz, Lx, Ly, Lz):
+        return
+    new_id = ids[vox_base + lin_idx(sx, sy, sz, Lx, Ly)]
+    if new_id == old_id:
+        return
+    new_t = cell_type[ct_base + new_id]
+    if new_id != 0 and type_frozen[new_t] == 1:
+        return
+
+    de = float(0.0)
+    if new_id != 0:
+        de += lambda_volume[cell_base + new_id] * (
+            1.0 + 2.0 * (volume[cell_base + new_id] - target_volume[cell_base + new_id])
+        )
+    if old_id != 0:
+        de += lambda_volume[cell_base + old_id] * (
+            1.0 - 2.0 * (volume[cell_base + old_id] - target_volume[cell_base + old_id])
+        )
+
+    for n in range(n_contact):
+        nnx = x + contact_off[3 * n + 0]
+        nny = y + contact_off[3 * n + 1]
+        nnz = z + contact_off[3 * n + 2]
+        ncell = get_id_b(ids, vox_base, nnx, nny, nnz, Lx, Ly, Lz)
+        nt = cell_type[ct_base + ncell]
+        if ncell != old_id:
+            de -= contact_rt(contact, r, n_types, old_t, nt)
+        if ncell != new_id:
+            de += contact_rt(contact, r, n_types, new_t, nt)
+
+    accept = False
+    if de <= 0.0:
+        accept = True
+    else:
+        if wp.randf(state) < wp.exp(-de / temperature[r]):
+            accept = True
+    if not accept:
+        return
+
     ids[target_idx] = new_id
     fx = wp.int64(x)
     fy = wp.int64(y)

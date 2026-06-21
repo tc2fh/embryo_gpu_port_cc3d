@@ -297,3 +297,44 @@ Decisions / notes (neither escalates):
 
 Next: Pass B — wrap the per-MCS loop in a CUDA Graph (dynamic link create/delete behind `wp.capture_if`) to cut
 launch/Python overhead; benchmark MCS/s + sims/hour vs the Phase-0 tuned multicore CPU baseline (~10.5 MCS/s).
+
+### Pass B — CUDA-Graph MCS capture + throughput benchmark — DONE (2026-06-20)
+
+Deterministic gate: CLEAN (gate fresh: tests_passed=true, **63 passed / 2 sanctioned skips** [56 prior + 7 new],
+reported 5 files / 590 lines; real ~904 lines / 5 files, in scope, no destructive ops, `embryo/` untouched).
+Implemented:
+- **`gpu_port/engine/graph.py`** — CUDA-Graph capture of the per-MCS DEVICE hot loop. Verified this Warp 1.14.0
+  build supports `wp.ScopedCapture`/`capture_begin`/`capture_end`/`capture_launch` AND `wp.capture_if` (ran a device
+  smoke test, not just symbol presence). **Capture boundary:** INSIDE = the 8x `metropolis_color_*_dev_mcs` sweep +
+  an on-device `mcs` increment (a device-resident 1-elem mcs array, so one captured graph replayed N times walks
+  mcs=m0..m0+N-1 instead of baking a literal mcs / repeating the Philox key); OUTSIDE = `recompute_trackers()`, FPP
+  `rebuild()`, neighbor/link-CSR HOST compaction, observable read-back (host work can't be captured). `capture_if`
+  not needed for FPP (link create/delete is host compaction; links are static within a sweep so the captured sweep
+  binds the current CSR; re-capture on topology change) but remains available for future device-only conditionals.
+- **Additive kernels in `kernels.py`** (+288, 0 deletions): 3 new `_dev_mcs` kernel variants (single + batched),
+  mechanical copies of the validated kernels differing only in reading mcs from a device array.
+- **`gpu_port/engine/bench.py`** — benchmark harness (opt-in `BENCH=1`).
+- **Tests** (phase4/tests/test_graph_capture.py, 7 new): graph==eager BIT-EXACT single + batched (R=5) on id-lattice
+  / int64 COM / volumes; device-mcs counter advances; bounded in-gate timing sanity (L=48, ~1.6s); heavy benchmark
+  behind `BENCH=1`.
+
+**Benchmark (RTX 5090 vs Phase-0 CPU 10.5 MCS/s):** single-engine GRAPH 19259 MCS/s @64^3 (4.92x over eager, 1834x
+CPU), 15230 @100^3 (1451x CPU), 8554 @128^3 (815x CPU). Batched sweep (graph): ~35k aggregate replica-MCS/s @64^3
+R=32 (~34,873 sims/hour @10k MCS/sim). Even eager alone ~370x CPU. **The port's core throughput goal is decisively met.**
+
+**FLAGGED FINDING — FPP runs are statistically faithful but NOT bit-reproducible (pre-existing from Phase 3, surfaced
+by Pass B's bit-exact testing; NOT caused by graph capture):** ~5/8 FPP reruns differ by ~one boundary voxel. Root
+cause: the FPP spring term reads LINKED cells' COM (which can be anywhere on the lattice) while concurrent same-color
+flips atomically update those COM accumulators — the 8-color checkerboard removes spatial-neighbor WRITE hazards but
+not these long-range cross-cell COM READS; atomic-append link-CSR ordering is a second source. This is NOT a fidelity
+bug (Phase 3 + Pass C validated FPP + full-Embryo statistics vs CPU CC3D within tolerance; parallel CPM inherently
+samples differently from sequential CPU) — it is a bit-REPRODUCIBILITY limitation. Pass A's "deterministic across
+re-runs" was STATISTICAL determinism (the distribution test passes every run), now made precise. Volume+Contact (no
+FPP) IS bit-reproducible (int64 COM). **DECISION ITEM for the user:** accept statistical-only reproducibility for FPP,
+or schedule a determinism fix (snapshot/double-buffer COM at the start of each color sweep so all FPP reads see a
+consistent pre-sweep COM — restores bit-exactness and matches the "links static within a sweep" contract). Orthogonal
+to Pass C; can be a focused follow-up. The graph==eager FPP test asserts valid exact partition + statistical match
+(mean vol 58.56 vs 58.59), not bit-exactness — the correct test design given the above.
+
+Next: Pass C — larger-lattice validation (single RTX 5090 / 32 GB) + bridge to cc3d-player5 / a torch-fed viewer;
+multi-GPU halo exchange deferred unless a target lattice provably exceeds single-GPU memory.

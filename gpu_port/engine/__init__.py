@@ -32,10 +32,13 @@ from .batched import (
 )
 from .cpu_reference import CPUReference
 from .fpp import FPPLinks, grid_graph_links
+from .graph import GraphRunner, BatchedGraphRunner
 from . import geometry
 from . import steppables
 from . import fpp
 from . import cohesotaxis
+from . import graph
+from . import bench
 
 __all__ = [
     "EngineConfig",
@@ -57,8 +60,12 @@ __all__ = [
     "CPUReference",
     "FPPLinks",
     "grid_graph_links",
+    "GraphRunner",
+    "BatchedGraphRunner",
     "geometry",
     "steppables",
     "fpp",
     "cohesotaxis",
+    "graph",
+    "bench",
 ]
