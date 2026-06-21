@@ -131,3 +131,42 @@ Decisions / notes (neither escalates):
 Next: Pass B — ifCohesotaxis=1 pipeline (stencil classify -> segmented compaction -> all-pairs PixelDist reduction
 -> Gumbel-max weighted select -> Manhattan-shell argmax) + Poisson link turnover, as on-device kernels; reuse
 Pass A's per-link FPP inventory + the create/delete/rebuild seam.
+
+### Pass B — on-device cohesotaxis pipeline + Poisson link turnover — DONE (2026-06-20)
+
+Deterministic gate: CLEAN (gate_result.json fresh: tests_passed=true, **38 passed** [30 prior + 8 new],
+4 files / 158 lines, in scope, no destructive ops). CPU reference matched:
+`Embryo_Model_dev/Embryo/Simulation/EmbryoSteppables.py::create_lamellipodia_link` + the `ifCohesotaxis==1`
+path (18-offset stencil; FreePixelList sorted by cumulative-Euclidean PixelDist -> SigWeights(Sigma=8) sigmoid
+PDF -> rng.choice; nth_order_neighbors at exact Manhattan == LamellipodiaDistance(2) with zCOM>pixel.z ->
+max-by-zCOM -> new_fpp_link(lambda=800, target=1, max=15); Poisson delete at rate 1-exp(-LamellaeRate),
+LamellaeRate=5/180). Implemented:
+- **New `gpu_port/engine/cohesotaxis.py`** — staged GPU pipeline as Warp kernels (constant stencil as flat
+  int32): classify_count -> fill (segmented compaction into per-slot CSR via host prefix-sum) -> pixeldist
+  (all-pairs reduction, one thread/free-pixel, serial sum = deterministic) -> gumbel_select (log-SigWeights +
+  Gumbel noise, Philox keyed (mcs,cell,seed), argmax) -> manhattan_argmax (exact-shell Substrate argmax-by-zCOM);
+  + `poisson_turnover_kernel` (Bernoulli(1-exp(-rate)) keyed (mcs,cell,seed)). Host `CohesotaxisPipeline`
+  orchestrates; created links go through Pass A's `FPPLinks.create_link`.
+- **Engine seam (`engine/steppables.py`):** `LamellipodiaSteppable` (GPU port of `LeadingEdgeSteppable`):
+  start() seeds links; step(mcs) runs on-device Poisson delete then recreates links for leaders lacking one
+  (cell.dict['link'] mirrored as CellDict int32 SoA `link_target`). Create/delete at the per-MCS boundary; CSR
+  rebuilt once per MCS, never inside the Metropolis loop. Wired into `engine/__init__.py`.
+- **Tests** (phase3/tests/test_cohesotaxis.py, 8 new): stencil-classify / PixelDist / Manhattan-shell argmax
+  EXACT vs NumPy; Gumbel-max selection matches SigWeights (==rng.choice) within sampling noise (max abs dev
+  <0.01), reproducible per key; Poisson rate matches 1-exp(-LamellaeRate) within 5sigma, reproducible; full
+  pipeline creates a link with correct per-link params; LamellipodiaSteppable runs through SteppableManager+engine
+  keeping the volume/COM partition invariant exact.
+
+Decisions / notes (neither escalates):
+- Gumbel-max with keyed Philox is the exact GPU equivalent of CC3D's `rng.choice(p=w)` (argmax_i(log w_i +
+  Gumbel_i)); reproducibility is per-key (independent rand_init streams per draw), NOT CC3D's single shared
+  sequential RNG stream — the sanctioned GPU approach (statistical fidelity validated, not stream identity).
+- Cohesotaxis exactness was validated on a constructed `_toy_scene` (substrate floor + climbing wall + a leader
+  hugging it), since cohesotaxis requires substrate ABOVE the leader (zCOM>pixel.z). **Carry-forward to Pass C:**
+  exercise cohesotaxis in the REAL full-Embryo geometry (ectoderm shell + real leaders) as part of the
+  closure/intercalation ensemble, not only the toy scene.
+
+Next: Pass C — port `EmbryoSteppables.py` under `gpu_port/embryo/` with minimal edits; validate closure
+free-area-vs-time + intercalation vs CPU CC3D over ensembles, and re-confirm link-length MEAN fidelity (Pass A
+carry-forward) under the real long-MCS regime. Completing Pass C closes Phase 3 -> summarizer writes
+`.phaserun/verdict_phase3.json`.

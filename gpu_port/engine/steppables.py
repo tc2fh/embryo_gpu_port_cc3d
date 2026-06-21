@@ -159,6 +159,83 @@ def _floor_free_area_kernel(
         wp.atomic_add(exposed_above, cid, 1)
 
 
+class LamellipodiaSteppable(GPUSteppable):
+    """GPU port of the Embryo ``LeadingEdgeSteppable`` lamellipodia dynamics
+    (``EmbryoSteppables.py``): the ``ifCohesotaxis`` link target selection +
+    Poisson link turnover, driven entirely by on-device kernels at the per-MCS
+    steppable boundary (the FPP create/delete seam from Pass A).
+
+    Per MCS, for each LEADING cell:
+      * if it has a lamellipodia link, delete it with Poisson prob
+        ``1-exp(-LamellaeRate)`` (on-device Bernoulli keyed by (mcs,cell,seed));
+      * if it then has no lamellipodia link, run the cohesotaxis pipeline to select
+        a substrate target and create a new lamellipodia link (per-link
+        LamellipodiaLambda / LLTargetDist / LLMaxDist) via ``FPPLinks.create_link``.
+
+    ``self.link_target[cid]`` mirrors CC3D ``cell.dict['link']`` (the substrate id a
+    leader is currently linked to; 0 = none). Links are created/deleted on the host
+    topology at this boundary, then the device CSR is rebuilt once per MCS by the
+    engine -- never inside the Metropolis inner loop.
+    """
+
+    def __init__(self, engine: GPUEngine, links, leading_type: int,
+                 substrate_type: int, passive_type: int,
+                 lamellipodia_distance: int | None = None, frequency: int = 1):
+        super().__init__(engine, frequency)
+        from . import cohesotaxis as CT
+        self._CT = CT
+        self.links = links
+        ld = CT.LAMELLIPODIA_DISTANCE if lamellipodia_distance is None else lamellipodia_distance
+        self.pipe = CT.CohesotaxisPipeline(
+            engine, leading_type=leading_type, substrate_type=substrate_type,
+            passive_type=passive_type, lamellipodia_distance=ld)
+        # cell.dict['link'] equivalent: substrate id each leader is linked to (0=none)
+        self.cell_dict.register("link_target", "int32", 0)
+        self.poisson_rate = CT.LAMELLAE_RATE
+
+    def _leaders(self):
+        return self.pipe.lead_ids
+
+    def start(self):
+        """Create the initial lamellipodia link for every leader (the
+        ``LeadingEdgeSteppable.start`` ``create_lamellipodia_link`` call)."""
+        created = self.pipe.create_lamellipodia_links(self.links, mcs=0)
+        lt = self.cell_dict.get("link_target")
+        for cell, tgt in created.items():
+            lt[cell] = tgt
+        self.cell_dict.set("link_target", lt)
+        return created
+
+    def step(self, mcs: int):
+        CT = self._CT
+        lt = self.cell_dict.get("link_target")
+        leaders = self._leaders()
+
+        # --- Poisson delete of existing lamellipodia links (on-device decisions) ---
+        n1 = self.engine.n_cells + 1
+        dec = CT.poisson_delete_decisions(n_cells=n1, mcs=mcs,
+                                          base_seed=self.engine.base_seed,
+                                          rate=self.poisson_rate, device=self.engine.device)
+        for cell in leaders:
+            tgt = int(lt[cell])
+            if tgt != 0 and dec[cell] == 1:
+                self.links.delete_link(int(cell), tgt)
+                lt[cell] = 0
+
+        # --- recreate lamellipodia links for leaders now lacking one ---
+        need = {int(c) for c in leaders if int(lt[c]) == 0}
+        if need:
+            created = self.pipe.create_lamellipodia_links(self.links, mcs=mcs,
+                                                          only_cells=need)
+            for cell, tgt in created.items():
+                lt[cell] = tgt
+
+        self.cell_dict.set("link_target", lt)
+        # links are static within the next sweep; the engine rebuilds the CSR at the
+        # MCS boundary (step_mcs), so no explicit rebuild() needed here.
+        return int(np.count_nonzero(lt[leaders]))
+
+
 class FloorFreeAreaSteppable(GPUSteppable):
     """Non-FPP example: tracks the substrate floor free area on the GPU each MCS.
 

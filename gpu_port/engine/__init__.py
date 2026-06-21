@@ -28,6 +28,7 @@ from .fpp import FPPLinks, grid_graph_links
 from . import geometry
 from . import steppables
 from . import fpp
+from . import cohesotaxis
 
 __all__ = [
     "EngineConfig",
@@ -47,4 +48,5 @@ __all__ = [
     "geometry",
     "steppables",
     "fpp",
+    "cohesotaxis",
 ]
