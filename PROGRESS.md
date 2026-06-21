@@ -257,7 +257,7 @@ Outstanding carry-forwards: (i) the long-horizon offline CC3D closure/intercalat
 NOT been run; (ii) the 27-color race-safe order-4 GPU SWEEP is future work (order-4 contact ENERGY is already shown
 GPU-reproducible, rel 0.029); production `EmbryoModel` stays at `contact_neighbor_order=3` (race-safe).
 
-## Phase 4 — batching / scaling / bridge — IN PROGRESS (plan_docs/phase_04_batching_scaling_bridge.md)
+## Phase 4 — batching / scaling / bridge — DONE (2026-06-20) — complete (plan_docs/phase_04_batching_scaling_bridge.md)
 
 Driven as tested passes (batch dimension / CUDA-graph + throughput / larger-lattice + bridge), each left
 `pytest -q gpu_port` green. Scope: `gpu_port/{engine,bridge,phase4}` — `embryo/` is OUT of scope this phase.
@@ -338,3 +338,49 @@ to Pass C; can be a focused follow-up. The graph==eager FPP test asserts valid e
 
 Next: Pass C — larger-lattice validation (single RTX 5090 / 32 GB) + bridge to cc3d-player5 / a torch-fed viewer;
 multi-GPU halo exchange deferred unless a target lattice provably exceeds single-GPU memory.
+
+### Pass C — larger-lattice validation + interactivity bridge — DONE (2026-06-20)
+
+Deterministic gate: CLEAN (gate fresh: tests_passed=true, **76 passed / 3 sanctioned skips** [63 prior + 13 new],
+reported 3 files / 238 lines; real ~757 lines / 4 files, in scope, no destructive ops, `embryo/` untouched).
+- **Larger-lattice scaling** (`engine/bench.py` `bench_large_lattice`, reusing the Pass B graph path): valid exact
+  partitions 512^3..1290^3. **Single-GPU ceiling = 1290^3 (~2.15B voxels, ~8.6 GB ids)** at 11.6 MCS/s (still >CPU).
+  **Multi-GPU DEFERRED, proven unnecessary:** the binding limit is the int32 voxel index in the hot-loop kernels
+  (`lin_idx`/`wp.tid()`), capping cubes at <2^31 voxels (~1290^3); memory (4 B/voxel) wouldn't bind until ~2950^3,
+  far past the index ceiling — no single-GPU lattice exhausts 32 GB first. Bigger = widen kernels to int64 indexing
+  (future work). Asserted in `test_memory_math_and_multigpu_verdict_cpu_only`.
+- **Bridge `gpu_port/bridge/`** (`viewer.py`): `LatticeView(engine, replica=)` — read-only, pull-based; `.id_field()`,
+  `.type_field()` (ids mapped through cell_type SoA), `.slice()`, `.projection()`, `.snapshot()`; `render_slice_png()`
+  (stdlib zlib PNG = default, dependency-free; matplotlib 'Agg' opt-in); `to_cc3d_cell_field()` for an optional
+  cc3d-player5 hand-off (CC3D (x,y,z) axis order). **Headless-safe** (no GUI/event loop; asserts on host arrays).
+  Correctness: every exported field == device `state` read-back (`array_equal`), single + batched per-replica.
+- **Tests** (phase4/tests/test_bridge_and_scale.py, 13 new): bridge export==state (all fields/axes/projections/
+  snapshot/batched/cc3d-transpose); larger-lattice valid partition (modest in-gate; max-scale behind `BENCH=1`);
+  the int32-ceiling memory-math / multi-GPU verdict.
+
+Decisions / notes (neither escalates):
+- Default render backend is the **stdlib zlib PNG writer** (matplotlib opt-in) because matplotlib `savefig` aborts the
+  pytest process on this box via an OpenMP DLL conflict (`libiomp5md.dll` vs torch `libomp.dll`) — honors the plan's
+  "prefer numpy-only export" and keeps the bridge headless-safe.
+
+**Phase 4 verdict:** complete; plan_deviation minor; escalate=false (`.phaserun/verdict_phase4.json`). Deterministic
+gate CLEAN at each pass (run MANUALLY; SubagentStop auto-hook inert this session): Pass A 56 / Pass B 63 / Pass C 76
+passed (+3 sanctioned opt-in skips: `CC3D_OFFLINE` ensemble + `BENCH` heavy benchmarks), all in scope, no destructive ops.
+
+---
+
+## PLAN COMPLETE — CC3D-GPU port (Phases 0–4) — 2026-06-20
+
+All five phases done and committed. The GPU port (NVIDIA Warp / RTX 5090) reproduces the CompuCell3D Embryo model:
+a GPU-resident CPM engine (8-color Volume+Contact, int64 fixed-point COM, hashed neighbor-CSR), FPP + on-device
+cohesotaxis, the full `EmbryoModel`, a parameter-sweep batch axis (bit-exact per replica), CUDA-graph MCS capture
+(**815–1834x the tuned multicore CPU baseline of ~10.5 MCS/s**, ~35k sims/hour batched), single-GPU scaling to
+1290^3, and a headless visualization bridge. 76 tests green (minus 3 sanctioned opt-in skips); GPU validated
+statistically vs CPU CC3D throughout (volume/energy/surface/COM, FPP link-length, cohesotaxis, order-4 contact,
+full-Embryo link inventory).
+
+**Open decision items / follow-ups (none blocking):** (1) **FPP bit-reproducibility** — accept statistical-only, or
+add the COM-snapshot/double-buffer fix (snapshot COM per color sweep before FPP reads); (2) **int64 voxel indexing**
+for lattices >1290^3 (not needed by any current target); (3) **batched FPP / end-to-end batched `EmbryoModel`** for
+FPP-parameter sweeps (needs a per-replica link CSR + `embryo/` edits; was out of Phase 4 scope); (4) the **long-horizon
+offline CC3D ensemble** (`CC3D_OFFLINE=1` test) carried from Phase 3 is still un-run.

@@ -117,6 +117,113 @@ def bench_batched(L: int = 64, R: int = 16, n_mcs: int = 200, warmup: int = 10,
     }
 
 
+# ---------------------------------------------------------------------------
+# Larger-lattice scaling probe (Phase 4 Pass C)
+# ---------------------------------------------------------------------------
+# The hot-loop kernels index the lattice with a 32-bit linear voxel index
+# (``lin_idx`` returns ``wp.int32`` and ``wp.tid()`` is int32). A flat ``ids``
+# of N voxels is therefore addressable only while N < 2**31 (~2.147e9 voxels,
+# i.e. a cube up to ~1290^3). The int32 id-lattice itself is just 4 bytes/voxel,
+# so on a 32 GB GPU the int32 INDEX limit -- not device memory -- is the binding
+# single-GPU constraint. ``MAX_SAFE_CUBE`` is the largest cube edge that stays
+# comfortably below the int32 index ceiling.
+INT32_VOXEL_LIMIT = 2_147_483_647        # 2**31 - 1
+MAX_SAFE_CUBE = 1280                     # 1280^3 = 2.097e9 voxels < 2**31
+
+
+def device_mem_gb(device: str = "cuda:0"):
+    """(free, total) device memory in GB via torch (the engine runs on torch's
+    CUDA context). Returns (nan, nan) if torch/CUDA is unavailable."""
+    try:
+        import torch
+        idx = int(device.split(":")[1]) if ":" in device else 0
+        free, total = torch.cuda.mem_get_info(idx)
+        return free / 1e9, total / 1e9
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def lattice_mem_estimate_gb(L: int) -> dict:
+    """Device-memory estimate for a single ``L^3`` graph-path run, broken down.
+
+    Dominant term is the flat int32 id-lattice (4 bytes/voxel). The graph hot
+    loop touches only ``ids`` + the (tiny, O(n_cells)) per-cell SoA; the boundary
+    tracker scratch (``is_boundary`` int32, another 4 bytes/voxel) is allocated
+    only if ``recompute_trackers`` is called. We report both so the budget is
+    explicit."""
+    nvox = L ** 3
+    ids_gb = nvox * 4 / 1e9
+    tracker_gb = nvox * 4 / 1e9              # is_boundary, only if trackers used
+    return {
+        "L": L, "n_voxels": nvox,
+        "ids_gb": ids_gb,
+        "hotloop_gb": ids_gb,                # graph/eager sweep: just the lattice
+        "with_tracker_gb": ids_gb + tracker_gb,
+        "exceeds_int32_index": nvox >= INT32_VOXEL_LIMIT,
+    }
+
+
+def bench_large_lattice(L: int, n_mcs: int = 100, warmup: int = 5, seed: int = 12345,
+                        block_target: int = 4, device: str = "cuda:0",
+                        verify_partition: bool = True) -> dict:
+    """Build + run ONE ``L^3`` lattice through the CUDA-graph hot loop and report
+    achieved MCS/s, measured device-memory delta, and exact-partition validity.
+
+    Uses a SINGLE engine (graph path) -- no eager second copy -- so the memory
+    footprint is just one lattice, letting us push toward the device limit. The
+    timed region is the graph replay only (the launch-overhead-free hot loop);
+    a warm-up replay precedes it. ``verify_partition`` runs the exact
+    volume==voxel-count + COM-drift check on the final state."""
+    if L ** 3 >= INT32_VOXEL_LIMIT:
+        raise ValueError(
+            f"L={L} -> {L**3} voxels exceeds the int32 voxel-index limit "
+            f"({INT32_VOXEL_LIMIT}); the hot-loop kernels index voxels with int32. "
+            f"Use L <= {MAX_SAFE_CUBE}."
+        )
+    cfg = _make_cfg(L, seed)
+    cpa = _cells_per_axis(L, block_target)
+
+    free0, total = device_mem_gb(device)
+    eng = GPUEngine(build_grid_state(cfg, cpa), device=device)
+    free1, _ = device_mem_gb(device)
+    gr = GraphRunner(eng)
+    gr.run(warmup)                                  # capture + warm-up
+    wp.synchronize()
+    free2, _ = device_mem_gb(device)
+
+    mcs_graph = _time_loop(lambda n: gr.run(n, mcs_offset=warmup), n_mcs)
+
+    valid = None
+    if verify_partition:
+        valid = bool(eng.assert_volume_partition())
+
+    # measured deltas (GB). free0 - free2 is the total footprint after warm-up.
+    state_gb = (free0 - free1) if np.isfinite(free0) else float("nan")
+    total_gb = (free0 - free2) if np.isfinite(free0) else float("nan")
+    est = lattice_mem_estimate_gb(L)
+    return {
+        "L": L, "n_cells": eng.n_cells, "n_voxels": L ** 3, "n_mcs": n_mcs,
+        "mcs_graph": mcs_graph,
+        "graph_vs_cpu": mcs_graph / CPU_BASELINE_MCS_PER_S,
+        "device_total_gb": total,
+        "device_free_before_gb": free0,
+        "state_alloc_gb": state_gb,            # measured: just the engine state
+        "total_alloc_gb": total_gb,            # measured: state + graph + scratch
+        "est_ids_gb": est["ids_gb"],
+        "valid_partition": valid,
+    }
+
+
+def _print_large(d: dict):
+    print(
+        f"[large L={d['L']}^3 voxels={d['n_voxels']:.3e} cells={d['n_cells']}] "
+        f"{d['mcs_graph']:8.1f} MCS/s (graph) | vs CPU(10.5) x{d['graph_vs_cpu']:.0f} | "
+        f"mem: state {d['state_alloc_gb']:.2f} GB, total {d['total_alloc_gb']:.2f} GB "
+        f"/ {d['device_total_gb']:.1f} GB (est ids {d['est_ids_gb']:.2f} GB) | "
+        f"valid_partition={d['valid_partition']}"
+    )
+
+
 def _print_single(d: dict):
     print(
         f"[single  L={d['L']}^3 cells={d['n_cells']} mcs={d['n_mcs']}] "
@@ -138,12 +245,22 @@ def _print_batched(d: dict):
 
 def main():
     heavy = os.environ.get("BENCH", "0") == "1"
-    print("=== Phase 4 Pass B throughput benchmark (RTX 5090) ===")
+    print("=== Phase 4 Pass B/C throughput benchmark (RTX 5090) ===")
     if heavy:
         for L in (64, 100, 128):
             _print_single(bench_single(L=L, n_mcs=500, warmup=20))
         for (L, R) in ((64, 16), (64, 32), (100, 16)):
             _print_batched(bench_batched(L=L, R=R, n_mcs=300, warmup=20))
+        # Pass C: larger single-GPU lattices via the graph path (toward the limit).
+        print("--- Pass C: larger single-GPU lattices (graph path) ---")
+        free, total = device_mem_gb()
+        print(f"device: {total:.1f} GB total, {free:.1f} GB free; int32 voxel "
+              f"limit {INT32_VOXEL_LIMIT:.3e} (max safe cube ~{MAX_SAFE_CUBE}^3)")
+        for L in (256, 512, 768, 1024):
+            try:
+                _print_large(bench_large_lattice(L=L, n_mcs=60, warmup=5))
+            except Exception as e:                       # OOM or index limit
+                print(f"[large L={L}^3] SKIPPED: {type(e).__name__}: {e}")
     else:
         _print_single(bench_single(L=64, n_mcs=200, warmup=10))
         _print_batched(bench_batched(L=64, R=16, n_mcs=150, warmup=10))
