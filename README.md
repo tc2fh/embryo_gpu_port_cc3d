@@ -42,8 +42,6 @@ substrate / lamellipodia link dynamics with Poisson turnover, and an on-device *
 
 ```bash
 pixi install
-# Warp is the core dependency but is not yet declared in pixi.toml / pixi.lock — install it into the env:
-pixi run pip install warp-lang==1.14.0
 ```
 
 Sanity check:
@@ -52,9 +50,8 @@ Sanity check:
 pixi run python -c "import warp; warp.init(); print('Warp', warp.__version__)"
 ```
 
-> **Note:** `compucell3d` (the CPU reference + the VTK that the 3-D viewer reuses) *is* in `pixi.toml`,
-> so `pixi install` provides it. Only Warp needs the extra `pip install` step above (see
-> [Known gaps](#known-gaps--follow-ups)).
+`pixi install` provides everything the project needs, including **NVIDIA Warp** (`warp-lang==1.14.0`) and
+**CompuCell3D** (the CPU reference plus the VTK that the 3-D viewer reuses).
 
 ## Run the test suite
 
@@ -143,8 +140,6 @@ host→device optimization). The narrative lives in [`PROGRESS.md`](PROGRESS.md)
 
 ## Known gaps / follow-ups
 
-- **Warp is not declared in `pixi.toml`** (hence the extra `pip install warp-lang==1.14.0`). Declaring it
-  with `pixi add --pypi warp-lang==1.14.0` would make `pixi install` self-contained.
 - `BatchedDeviceFPP.build_csr_and_attach` still does R serial device→device copies (O(R) launches at
   large R); a batched-gather kernel would remove it.
 - int64 voxel indexing to exceed the 1290³ int32-index ceiling.
